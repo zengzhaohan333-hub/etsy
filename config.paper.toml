@@ -1,0 +1,14 @@
+# 演示参数，不是投资建议；所有金额单位为 USDT。百分比按小数填写。
+instrument = "BTC-USDT-SWAP"
+bar = "15m"
+fast_window = 5
+slow_window = 20
+initial_equity = "10000"
+risk_per_trade = "0.005"          # 每笔目标风险预算 0.5%，跳空可能超出
+max_position_fraction = "0.10"    # 仓位名义价值不超过权益的 10%
+max_notional = "200"             # 单笔名义价值额外上限
+stop_loss_pct = "0.01"
+take_profit_pct = "0.02"
+max_drawdown_pct = "0.05"         # 本次运行从权益高点回撤 5% 时停止
+fee_rate = "0.0005"              # 单边费用假设；须核对自己账户实际费率
+slippage_rate = "0.0002"         # 单边滑点假设；不是成交保证
