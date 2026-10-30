@@ -1,4 +1,4 @@
-"""Historical 15-minute replay of the demo runner's one-position strategy.
+"""Historical 5m/15m replay of the demo runner's one-position strategy.
 
 No network, credentials or exchange mutation is performed here. Trade candles
 form signals and approximate fills; mark candles trigger protection and value
@@ -17,7 +17,9 @@ from .okx import Candle, Instrument
 
 
 D = Decimal
+# Retained as the legacy/default fixture interval; replay uses config.bar below.
 BAR_MS = 15 * 60_000
+SUPPORTED_BARS = {"5m": 5 * 60_000, "15m": BAR_MS}
 
 
 @dataclass
@@ -40,14 +42,14 @@ def _positive(value: Any, label: str, *, zero: bool = False) -> Decimal:
     return value
 
 
-def _validate_candles(candles: list[Candle], label: str) -> None:
+def _validate_candles(candles: list[Candle], label: str, bar_ms: int) -> None:
     if not candles:
         raise ValueError(f"{label} candles are empty")
     previous = None
     for candle in candles:
-        if not isinstance(candle, Candle) or type(candle.ts) is not int or candle.ts < 0 or candle.ts % BAR_MS:
-            raise ValueError(f"{label} timestamps must be nonnegative, 15-minute-aligned integers")
-        if previous is not None and candle.ts - previous != BAR_MS:
+        if not isinstance(candle, Candle) or type(candle.ts) is not int or candle.ts < 0 or candle.ts % bar_ms:
+            raise ValueError(f"{label} timestamps must be nonnegative integers aligned to {bar_ms // 60_000}-minute bars")
+        if previous is not None and candle.ts - previous != bar_ms:
             raise ValueError(f"{label} candles must be strictly ordered and complete, without duplicates or gaps")
         for field in ("open", "high", "low", "close"):
             _positive(getattr(candle, field), f"{label} {field}")
@@ -76,11 +78,12 @@ def run_backtest(config: Config, trade_candles: list[Candle], mark_candles: list
     open. Crossings while holding are ignored, including one just before a gap
     exit. Drawdown stops entries, never forcibly closes an exchange position.
     """
-    if config.bar != "15m":
-        raise ValueError("Historical replay currently supports 15m bars only")
+    if config.bar not in SUPPORTED_BARS:
+        raise ValueError("Historical replay currently supports 5m and 15m bars only")
+    bar_ms = SUPPORTED_BARS[config.bar]
     if (type(start_ms) is not int or type(end_ms) is not int or start_ms < 0
-            or start_ms >= end_ms or start_ms % BAR_MS or end_ms % BAR_MS):
-        raise ValueError("Backtest bounds must define a nonempty, 15-minute-aligned interval")
+            or start_ms >= end_ms or start_ms % bar_ms or end_ms % bar_ms):
+        raise ValueError(f"Backtest bounds must define a nonempty interval aligned to {config.bar} bars")
     _positive(starting_equity, "starting_equity")
     _positive(fee_multiplier, "fee_multiplier", zero=True)
     _positive(slippage_multiplier, "slippage_multiplier", zero=True)
@@ -96,7 +99,7 @@ def run_backtest(config: Config, trade_candles: list[Candle], mark_candles: list
     # A caller may pass the complete dataset to several chronological segments.
     # Read only timestamps outside this segment; future OHLC must not affect a
     # training segment, even through validation. Older history is not preloaded.
-    lower = start_ms - (config.slow_window + 1) * BAR_MS
+    lower = start_ms - (config.slow_window + 1) * bar_ms
     def selected(candles: list[Candle], label: str) -> list[Candle]:
         result = []
         for candle in candles:
@@ -107,17 +110,17 @@ def run_backtest(config: Config, trade_candles: list[Candle], mark_candles: list
         return result
     trade_candles = selected(trade_candles, "trade")
     mark_candles = selected(mark_candles, "mark")
-    _validate_candles(trade_candles, "trade")
-    _validate_candles(mark_candles, "mark")
+    _validate_candles(trade_candles, "trade", bar_ms)
+    _validate_candles(mark_candles, "mark", bar_ms)
     if [c.ts for c in trade_candles] != [c.ts for c in mark_candles]:
         raise ValueError("Trade and mark candles must have exactly matching timestamps")
     warmup = [c for c in trade_candles if c.ts < start_ms]
     measured = [index for index, candle in enumerate(trade_candles) if start_ms <= candle.ts < end_ms]
     if len(warmup) < config.slow_window + 1:
         raise ValueError("At least slow_window + 1 preceding candles are required for warm-up")
-    if (len(measured) != (end_ms - start_ms) // BAR_MS
+    if (len(measured) != (end_ms - start_ms) // bar_ms
             or trade_candles[measured[0]].ts != start_ms
-            or trade_candles[measured[-1]].ts != end_ms - BAR_MS):
+            or trade_candles[measured[-1]].ts != end_ms - bar_ms):
         raise ValueError("Trade and mark candles do not completely cover the measured interval")
     settlements: dict[int, Decimal] = {}
     previous_funding = None
@@ -125,8 +128,8 @@ def run_backtest(config: Config, trade_candles: list[Candle], mark_candles: list
         if not isinstance(row, (tuple, list)) or len(row) != 2:
             raise ValueError("Funding records must be timestamp/rate pairs")
         ts, rate = row
-        if type(ts) is not int or ts < 0 or ts % BAR_MS:
-            raise ValueError("Funding settlement timestamps must be 15-minute aligned")
+        if type(ts) is not int or ts < 0 or ts % bar_ms:
+            raise ValueError(f"Funding settlement timestamps must be aligned to {config.bar} bars")
         if previous_funding is not None and ts <= previous_funding:
             raise ValueError("Funding events must be strictly ordered without duplicates")
         if not isinstance(rate, Decimal) or not rate.is_finite():
@@ -184,7 +187,7 @@ def run_backtest(config: Config, trade_candles: list[Candle], mark_candles: list
         exit_fee = fill * p.quantity * fee_rate
         cash += gross - exit_fee
         fees += exit_fee
-        timestamp = bar_ts if at_open else bar_ts + BAR_MS
+        timestamp = bar_ts if at_open else bar_ts + bar_ms
         trades.append({
             "side": p.side, "contracts": p.contracts, "quantity": p.quantity,
             "entry_time": p.entry_time, "exit_time": timestamp, "exit_bar_ts": bar_ts,
@@ -247,7 +250,7 @@ def run_backtest(config: Config, trade_candles: list[Candle], mark_candles: list
                 reference = min(max(trigger, trade.low), trade.high)
                 close(reference, trade.ts,
                       "stop_loss" if hit_sl else "take_profit", at_open=False)
-        sample(trade.ts + BAR_MS, mark.close, "close")
+        sample(trade.ts + bar_ms, mark.close, "close")
         signal = strategy.update(trade)
         if position is None and not halted:
             pending = signal
@@ -285,7 +288,7 @@ def run_backtest(config: Config, trade_candles: list[Candle], mark_candles: list
         "open_position": open_position, "trades": trades, "equity_curve": curve,
         "fee_rate": fee_rate, "slippage_rate": slip_rate,
         "assumptions": [
-            "使用已收盘的15分钟成交价K线计算均线；预热期信号不下单，测量期的新信号在下一根K线开盘估算成交。",
+            f"使用已收盘的{bar_ms // 60_000}分钟成交价K线计算均线；预热期信号不下单，测量期的新信号在下一根K线开盘估算成交。",
             "最多持有一个1倍逐仓仓位；持仓期间忽略交叉信号，不反手或加仓。",
             "入场和跳空退出采用成交价K线开盘价，再叠加不利滑点。",
             "止盈止损由标记价格触发；盘中退出的参考价限制在该根成交价K线高低区间内，再叠加不利滑点。触发时刻的成交价与盘口未知，因此只是近似。",

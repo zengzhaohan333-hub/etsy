@@ -21,6 +21,7 @@ import tomllib
 
 MAX_BYTES = 4 * 1024 * 1024
 MAX_AGE_MS = 90_000
+PORTFOLIO_INSTRUMENTS = ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP")
 _CONNECTION_CATEGORIES = frozenset({"local", "api", "http", "redirect", "proxy", "rate_limit",
                                     "server", "timeout", "tls", "dns", "transport", "invalid_response",
                                     "credential_format"})
@@ -33,7 +34,7 @@ def _number(value):
         number = Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
-    if (not number.is_finite() or abs(number) > Decimal("1e30")
+    if (not number.is_finite() or number.copy_abs() > Decimal("1e30")
             or not -30 <= number.as_tuple().exponent <= 30):
         return None
     return format(number, "f")
@@ -41,6 +42,49 @@ def _number(value):
 
 def _timestamp(value):
     return value if type(value) is int and 0 <= value <= 32_503_680_000_000 else None
+
+
+def _positive_number(value, *, zero=False):
+    number = _number(value)
+    if number is None or Decimal(number) < 0 or (not zero and Decimal(number) == 0):
+        return None
+    return number
+
+
+def _position(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return {"side": "unknown", "contracts": None, "entry_price": None, "uncertain": True}
+    direction = value.get("side")
+    direction = direction if type(direction) is str and direction in {"long", "short"} else "unknown"
+    contracts, price = _number(value.get("contracts")), _number(value.get("entry_price"))
+    incomplete = (direction == "unknown" or contracts is None or Decimal(contracts) <= 0
+                  or price is None or Decimal(price) <= 0)
+    return {"side": direction, "contracts": contracts, "entry_price": price,
+            "uncertain": bool(value.get("status")) or value.get("uncertain") is True or incomplete}
+
+
+def _markets(state):
+    raw = state.get("markets")
+    raw = raw if isinstance(raw, dict) else {}
+    result = {}
+    for instrument in PORTFOLIO_INSTRUMENTS:
+        value = raw.get(instrument)
+        value = value if isinstance(value, dict) else {}
+        position = _position(value.get("position")) if "position" in value else _position("unknown")
+        entries = value.get("entries")
+        phase = value.get("phase")
+        result[instrument] = {
+            "position": position,
+            "entries": entries if type(entries) is int and entries >= 0 else None,
+            "last_success_at_ms": _timestamp(value.get("last_success_at_ms")),
+            "phase": phase if type(phase) is str and phase in {"starting", "running", "waiting", "holding", "stopped", "halted"} else None,
+            "last_candle_ts": _timestamp(value.get("last_candle_ts")),
+            "mark_price": _positive_number(value.get("mark_price")),
+            "notional": _positive_number(value.get("notional"), zero=True),
+        }
+    return result
 
 
 def _tls_failure(category, value):
@@ -108,6 +152,8 @@ def _halt_message(state):
     known = {"OKX HTTPS request failed; check network, time and demo credentials": "旧版记录了 HTTPS 查询失败，具体网络类型未记录；这不表示已经确认密钥失效。",
              "Read verification time budget exceeded; inspect exchange state": "账户或订单读取核对超过时间预算，请检查网络并核对欧易状态。",
              "Session drawdown limit reached; new entries stopped; any reported position remains open": "会话权益触及回撤阈值，已停止新增交易；已有仓位不会自动平仓。",
+             "Portfolio session drawdown limit reached; all new entries stopped; existing positions remain open": "共享账户权益触及会话回撤阈值，四币均已停止新增交易；已有仓位不会自动平仓。",
+             "Portfolio mark price is stale or invalid": "四币核对中的标记价格过期或无效，组合已停止，请检查行情连接与实际仓位。",
              "Missed candle interval; restart safely instead of trading old signals": "行情 K 线出现跨周期缺口，机器人停止并保留核对要求。"}
     return known.get(reason, "机器人记录异常停止，请查看启动窗口并到欧易核对订单与保护单。") if type(reason) is str else "机器人记录异常停止，请到欧易核对订单与保护单。"
 
@@ -128,11 +174,12 @@ class DemoMonitor:
         self.curve = deque(maxlen=2000)
         self.lock = threading.Lock()
 
-    def _profile(self):
+    def _profile(self, scope="single"):
         result = {}
         try:
             # Fixed sibling config filename only; unknown fields never leave.
-            with (self.status_file.parent.parent / "config.paper.toml").open("rb") as stream:
+            filename = "config.portfolio.toml" if scope == "portfolio" else "config.paper.toml"
+            with (self.status_file.parent.parent / filename).open("rb") as stream:
                 raw = stream.read(64 * 1024 + 1)
             if len(raw) > 64 * 1024:
                 return result
@@ -145,7 +192,7 @@ class DemoMonitor:
             for key in ("fast_window", "slow_window"):
                 if type(config.get(key)) is int and 2 <= config[key] <= 200:
                     result[key] = config[key]
-            for key in ("stop_loss_pct", "take_profit_pct", "max_drawdown_pct", "max_notional"):
+            for key in ("stop_loss_pct", "take_profit_pct", "max_drawdown_pct", "max_notional", "max_total_notional"):
                 number = _number(config.get(key))
                 if number is not None and Decimal(number) > 0:
                     result[key] = number
@@ -163,6 +210,8 @@ class DemoMonitor:
                 if not isinstance(row, dict):
                     continue
                 item = {}
+                if row.get("instrument") in PORTFOLIO_INSTRUMENTS:
+                    item["instrument"] = row["instrument"]
                 if row.get("side") in {"long", "short"}:
                     item["side"] = row["side"]
                 for key in ("size", "stop_loss", "take_profit"):
@@ -198,20 +247,34 @@ class DemoMonitor:
             connection = _connection(state.get("connection"))
             phase = state.get("phase") if state.get("phase") in {"starting", "running", "stopped", "halted"} else None
             last_success = _timestamp(state.get("last_success_at_ms"))
+            equity_checked = _timestamp(state.get("equity_checked_at_ms"))
+            has_equity_time = "equity_checked_at_ms" in state
+            scope = "portfolio" if state.get("scope") == "portfolio" else "single"
+            if scope == "portfolio":
+                instruments = state.get("instruments")
+                if (not isinstance(instruments, list) or len(instruments) != len(PORTFOLIO_INSTRUMENTS)
+                        or not all(type(value) is str for value in instruments)
+                        or set(instruments) != set(PORTFOLIO_INSTRUMENTS)):
+                    raise ValueError()
+            markets = _markets(state) if scope == "portfolio" else None
             position = state.get("position")
             clean_position = None
-            if isinstance(position, dict):
-                clean_position = {"side": position.get("side") if position.get("side") in {"long", "short"} else "unknown",
-                                  "contracts": _number(position.get("contracts")),
-                                  "entry_price": _number(position.get("entry_price")),
-                                  "uncertain": bool(position.get("status"))}
-            elif position is not None:
+            if scope != "portfolio" and isinstance(position, dict):
+                clean_position = _position(position)
+            elif scope != "portfolio" and position is not None:
                 raise ValueError()
             equity = _number(state.get("equity"))
-            sample_time = last_success if last_success is not None else updated
-            sample_age = now - sample_time
-            sample_valid = (not state["halted"] and not stale and -5_000 <= sample_age <= MAX_AGE_MS
-                            and phase != "stopped" and (connection is None or connection["state"] == "connected"))
+            # A new heartbeat does not refresh an earlier balance. New runners
+            # must have both a fresh completed cycle and a fresh balance query.
+            # Only genuinely old status formats fall back to heartbeat time.
+            legacy = connection is None and last_success is None and not has_equity_time
+            cycle_time = last_success if last_success is not None else updated if legacy else None
+            sample_time = equity_checked if has_equity_time else cycle_time
+            cycle_fresh = cycle_time is not None and -5_000 <= now - cycle_time <= MAX_AGE_MS
+            sample_fresh = sample_time is not None and -5_000 <= now - sample_time <= MAX_AGE_MS
+            sample_valid = (not state["halted"] and not stale and cycle_fresh and sample_fresh
+                            and phase in {None, "running"}
+                            and (connection is None or connection["state"] == "connected"))
             with self.lock:
                 if equity is not None and sample_valid:
                     if not self.curve or sample_time > self.curve[-1]["ts"]:
@@ -221,12 +284,39 @@ class DemoMonitor:
                         self.curve.append({"ts": sample_time, "equity": equity})
                 curve = list(self.curve)
             orders, warning = self._journal()
+            if markets is not None:
+                unassigned_pending = False
+                for order in orders:
+                    instrument = order.get("instrument")
+                    unresolved = order.get("status") in {"intent", "accepted", "inspect_required", "unknown"}
+                    if unresolved and instrument not in markets:
+                        unassigned_pending = True
+                    if instrument in markets and unresolved:
+                        position = markets[instrument]["position"]
+                        if position is None:
+                            position = _position("unknown")
+                            markets[instrument]["position"] = position
+                        position["uncertain"] = True
+                if unassigned_pending:
+                    for value in markets.values():
+                        if value["position"] is None:
+                            value["position"] = _position("unknown")
+                        value["position"]["uncertain"] = True
+                if any(value["position"] is not None and value["position"]["uncertain"] for value in markets.values()):
+                    warning = "部分币种仓位或订单状态需要核对，不能将缺失记录当作空仓。" + (warning or "")
             return {"ok": True, "mode": "demo", "halted": state["halted"],
+                    "scope": scope, "instruments": list(PORTFOLIO_INSTRUMENTS) if markets is not None else None,
+                    "markets": markets,
+                    "bar": state.get("bar") if state.get("bar") in ("1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H") else None,
+                    "gross_notional": _positive_number(state.get("gross_notional"), zero=True) if markets is not None else None,
+                    "max_total_notional": _positive_number(state.get("max_total_notional")) if markets is not None else None,
+                    "max_notional_per_market": _positive_number(state.get("max_notional_per_market")) if markets is not None else None,
                     "stale": stale, "updated_at_ms": updated, "age_ms": max(0, age),
                     "equity": equity, "entries": state["entries"], "position": clean_position,
                     "phase": phase, "connection": connection, "last_success_at_ms": last_success,
+                    "equity_checked_at_ms": equity_checked,
                     "halt_message": _halt_message(state),
-                    "profile": self._profile(), "orders": orders, "warning": warning,
+                    "profile": self._profile(scope), "orders": orders, "warning": warning,
                     "equity_curve": curve,
                     "health": ("halted" if state["halted"] else "stopped" if phase == "stopped"
                                else "stale" if stale else connection["state"] if connection is not None

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from okx_bot.monitor import DemoMonitor, handler_for
+from okx_bot.monitor import DemoMonitor, PORTFOLIO_INSTRUMENTS, handler_for
 
 
 class MonitorTests(unittest.TestCase):
@@ -231,6 +231,144 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(result["stale"])
         self.assertFalse(result["halted"])
         self.assertEqual(result["equity_curve"], [])
+
+    def portfolio(self):
+        self.state.update(scope="portfolio", instruments=list(PORTFOLIO_INSTRUMENTS), bar="5m",
+                          phase="running", last_success_at_ms=self.now,
+                          connection={"state": "connected", "attempt": 0, "max_attempts": 3},
+                          markets={instrument: {"position": None, "entries": 0, "phase": "running",
+                                                "last_success_at_ms": self.now}
+                                   for instrument in PORTFOLIO_INSTRUMENTS})
+
+    def test_portfolio_keeps_independent_positions_and_one_account_equity(self):
+        self.portfolio()
+        self.state["entries"] = 3
+        self.state.update(gross_notional="350", max_total_notional="800", max_notional_per_market="200")
+        self.state["markets"]["BTC-USDT-SWAP"].update(entries=1, position={
+            "side": "long", "contracts": ".12", "entry_price": "70000", "secret": "test-key"},
+            phase="holding", notional="150", mark_price="70000")
+        self.state["markets"]["ETH-USDT-SWAP"].update(entries=2, position={
+            "side": "short", "contracts": "2", "entry_price": "2000"})
+        self.state["markets"]["SOL-USDT-SWAP"]["last_success_at_ms"] = self.now - 100_000
+        self.write()
+        before = self.status.read_bytes()
+        result = self.monitor.snapshot(self.now)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["scope"], "portfolio")
+        self.assertEqual(result["bar"], "5m")
+        self.assertEqual(result["equity"], "5000")
+        self.assertEqual(result["entries"], 3)
+        self.assertEqual(result["gross_notional"], "350")
+        self.assertEqual(result["max_total_notional"], "800")
+        self.assertEqual(result["max_notional_per_market"], "200")
+        self.assertEqual(len(result["equity_curve"]), 1)
+        self.assertIsNone(result["position"])
+        self.assertEqual(result["markets"]["BTC-USDT-SWAP"]["position"]["side"], "long")
+        self.assertEqual(result["markets"]["BTC-USDT-SWAP"]["phase"], "holding")
+        self.assertEqual(result["markets"]["BTC-USDT-SWAP"]["notional"], "150")
+        self.assertEqual(result["markets"]["ETH-USDT-SWAP"]["position"]["side"], "short")
+        self.assertEqual(result["markets"]["ETH-USDT-SWAP"]["entries"], 2)
+        self.assertIsNone(result["markets"]["XRP-USDT-SWAP"]["position"])
+        self.assertEqual(result["markets"]["SOL-USDT-SWAP"]["last_success_at_ms"], self.now - 100_000)
+        self.assertTrue(all("equity" not in row for row in result["markets"].values()))
+        self.assertNotIn("test-key", json.dumps(result))
+        self.assertEqual(self.status.read_bytes(), before)
+
+    def test_portfolio_config_uses_portfolio_file_and_journal_instrument_is_whitelisted(self):
+        self.portfolio()
+        self.write()
+        (self.root / "config.paper.toml").write_text('bar="15m"\nmax_notional="999"\n')
+        (self.root / "config.portfolio.toml").write_text(
+            'bar="5m"\nfast_window=5\nslow_window=20\nmax_notional="200"\n'
+            'max_total_notional="800"\nmax_drawdown_pct=".05"\nsecret="test-secret"\n')
+        journal = self.directory / "demo-journal.json"
+        journal.write_text(json.dumps({"version": 1, "orders": [
+            {"instrument": "ETH-USDT-SWAP", "status": "protected", "side": "short", "size": "1"},
+            {"instrument": "test-secret", "status": "closed", "side": "long"}]}))
+        result = self.monitor.snapshot(self.now)
+        self.assertEqual(result["profile"]["bar"], "5m")
+        self.assertEqual(result["profile"]["max_notional"], "200")
+        self.assertEqual(result["profile"]["max_total_notional"], "800")
+        self.assertEqual(result["orders"][1]["instrument"], "ETH-USDT-SWAP")
+        self.assertNotIn("instrument", result["orders"][0])
+        self.assertNotIn("test-secret", json.dumps(result))
+
+    def test_portfolio_missing_or_unresolved_records_never_look_flat(self):
+        self.portfolio()
+        del self.state["markets"]["SOL-USDT-SWAP"]
+        self.state["markets"]["ETH-USDT-SWAP"].update(entries=True, position={"side": "long"},
+                                                                   phase="test-secret")
+        self.state["markets"]["DOGE-USDT-SWAP"] = {"secret": "test-key"}
+        self.write()
+        journal = self.directory / "demo-journal.json"
+        journal.write_text(json.dumps({"version": 1, "orders": [
+            {"instrument": "XRP-USDT-SWAP", "status": "inspect_required", "side": "long"}]}))
+        result = self.monitor.snapshot(self.now)
+        self.assertTrue(result["ok"])
+        for instrument in ("SOL-USDT-SWAP", "ETH-USDT-SWAP", "XRP-USDT-SWAP"):
+            self.assertTrue(result["markets"][instrument]["position"]["uncertain"])
+        self.assertIsNone(result["markets"]["ETH-USDT-SWAP"]["entries"])
+        self.assertIsNone(result["markets"]["ETH-USDT-SWAP"]["phase"])
+        self.assertIn("不能将缺失记录当作空仓", result["warning"])
+        self.assertNotIn("DOGE-USDT-SWAP", json.dumps(result))
+        self.assertNotIn("test-secret", json.dumps(result))
+        self.assertNotIn("test-key", json.dumps(result))
+
+    def test_portfolio_rejects_unexpected_instrument_membership(self):
+        self.portfolio()
+        self.state["instruments"][-1] = "DOGE-USDT-SWAP"
+        self.write()
+        self.assertFalse(self.monitor.snapshot(self.now)["ok"])
+
+    def test_balance_query_time_controls_curve_sampling_not_cycle_heartbeat(self):
+        self.portfolio()
+        self.state["equity_checked_at_ms"] = self.now - 120_000
+        self.write()
+        result = self.monitor.snapshot(self.now)
+        self.assertEqual(result["equity_checked_at_ms"], self.now - 120_000)
+        self.assertEqual(result["health"], "updating")
+        self.assertEqual(result["equity_curve"], [])
+        self.state["equity_checked_at_ms"] = self.now - 10_000
+        self.write()
+        result = self.monitor.snapshot(self.now)
+        self.assertEqual(result["equity_curve"], [{"ts": self.now - 10_000, "equity": "5000"}])
+        self.state.update(updated_at_ms=self.now + 5000, last_success_at_ms=self.now + 5000,
+                          equity_checked_at_ms=self.now - 10_000)
+        self.write()
+        self.assertEqual(len(self.monitor.snapshot(self.now + 5000)["equity_curve"]), 1)
+
+    def test_fresh_balance_requires_fresh_complete_cycle_and_connected_state(self):
+        self.portfolio()
+        self.state.update(equity_checked_at_ms=self.now, last_success_at_ms=self.now - 120_000)
+        self.write()
+        self.assertEqual(self.monitor.snapshot(self.now)["equity_curve"], [])
+        self.state["last_success_at_ms"] = self.now
+        for phase, connection_state in (("running", "retrying"), ("starting", "connected"),
+                                        ("running", "checking"), ("stopped", "connected")):
+            with self.subTest(phase=phase, connection=connection_state):
+                self.state["phase"] = phase
+                self.state["connection"]["state"] = connection_state
+                self.write()
+                self.assertEqual(self.monitor.snapshot(self.now)["equity_curve"], [])
+
+    def test_invalid_explicit_balance_timestamp_is_not_replaced_by_fresh_heartbeat(self):
+        self.portfolio()
+        for timestamp in (True, "test-secret", self.now + 99_999_999_999_999, [self.now], None):
+            with self.subTest(timestamp=timestamp):
+                self.state["equity_checked_at_ms"] = timestamp
+                self.write()
+                result = self.monitor.snapshot(self.now)
+                self.assertIsNone(result["equity_checked_at_ms"])
+                self.assertEqual(result["equity_curve"], [])
+                self.assertNotIn("test-secret", json.dumps(result))
+
+    def test_unknown_pending_portfolio_order_does_not_claim_any_market_flat(self):
+        self.portfolio()
+        self.write()
+        (self.directory / "demo-journal.json").write_text(json.dumps({"version": 1, "orders": [
+            {"status": "intent", "side": "long"}]}))
+        result = self.monitor.snapshot(self.now)
+        self.assertTrue(all(value["position"]["uncertain"] for value in result["markets"].values()))
 
     def test_local_page_nonce_and_read_only_routes(self):
         code, body, handler = self.request(path="/")

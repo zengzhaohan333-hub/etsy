@@ -1,0 +1,15 @@
+# 四币种欧易模拟盘组合；无实盘入口，也不要在此文件填写任何 API 凭证。
+instruments = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP"]
+bar = "5m"
+fast_window = 5
+slow_window = 20
+initial_equity = "10000"          # 共享资金计算上限，运行时仍受实际权益及可用资金限制
+risk_per_trade = "0.005"          # 每笔目标风险预算 0.5%，不保证实际亏损不超过预算
+max_position_fraction = "0.10"    # 每币仓位名义价值计算比例上限
+max_notional = "200"             # 用户选择：每币单笔名义金额上限 200 USDT
+max_total_notional = "800"       # 用户选择：四币共享名义金额总上限 800 USDT
+stop_loss_pct = "0.01"
+take_profit_pct = "0.02"
+max_drawdown_pct = "0.05"         # 共享会话权益从高点回撤 5% 时停止新增交易
+fee_rate = "0.0005"              # 费用假设，须核对账户实际费率
+slippage_rate = "0.0002"         # 滑点假设，不是成交保证

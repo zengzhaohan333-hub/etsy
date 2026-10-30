@@ -25,6 +25,7 @@ from .config import Config, load_config
 from .demo import run_demo
 from .okx import Credentials, OkxClient, OkxError, _safe_tls_failure
 from .read_retry import ReadRetryClient
+from .portfolio_config import load_portfolio_config
 
 
 class ConnectionCheckError(RuntimeError):
@@ -122,6 +123,51 @@ def check_demo(config: Config, client: Any, *,
             "equity": equity, "available": available, "flat": True}
 
 
+def check_portfolio(config: Any, client: Any, *,
+                    progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+    """Check the shared account once and each selected market without writes."""
+    report = progress or (lambda _message: None)
+    client = ReadRetryClient(client, threading.Event(),
+        on_retry=lambda event: report(f"只读查询暂未成功，正在重试 {event['attempt']}/{event['max_attempts']}……"),
+        on_recovered=lambda: report("只读查询已恢复，继续核对组合账户与挂单……"))
+    client.begin_cycle(60)
+    report("正在检查欧易公共接口与系统时间（此请求不发送凭证）……")
+    server_ms = client.server_time()
+    if type(server_ms) is not int or abs(server_ms - time.time_ns() // 1_000_000) > 5_000:
+        raise ConnectionCheckError("电脑与欧易服务器的时间相差超过 5 秒，请先同步电脑时间。")
+    report("公共接口及时间检查通过，正在检查四币模拟盘 API……")
+    account = client.account_config()
+    if account.get("posMode") != "net_mode":
+        raise ConnectionCheckError("模拟账户需要使用单向持仓模式（net_mode）。请先在欧易模拟盘切换，向导不会替你修改账户。")
+    if str(account.get("acctLv")) != "2":
+        raise ConnectionCheckError("模拟账户需要使用单币种保证金模式（acctLv=2）。请先在欧易模拟盘设置。")
+    balance = client.balances()
+    equity = _finite_decimal(balance.get("equity"), "USDT 权益")
+    available = _finite_decimal(balance.get("available"), "可用 USDT 权益")
+    if balance.get("currency") != "USDT" or equity <= 0 or available <= 0:
+        raise ConnectionCheckError("模拟账户没有足够的正数 USDT 权益和可用资金。请先在欧易模拟盘补充模拟资金。")
+    for market in config.market_configs():
+        client.begin_cycle(60)
+        report(f"正在只读核对 {market.instrument} 的合约、持仓与挂单……")
+        instrument = client.instrument(market.instrument)
+        if (instrument.inst_id != market.instrument or instrument.settle_ccy != "USDT"
+                or instrument.ct_val_ccy != market.instrument.split("-")[0] or instrument.state != "live"):
+            raise ConnectionCheckError(f"{market.instrument} 不是可用的 USDT 永续合约，未启动组合。")
+        for field in ("ct_val", "lot_size", "min_size", "max_market_size", "tick_size"):
+            if _finite_decimal(getattr(instrument, field), "合约规格") <= 0:
+                raise ConnectionCheckError("合约规格必须为正数，未启动组合。")
+        positions = client.positions(market.instrument)
+        if not isinstance(positions, list):
+            raise ConnectionCheckError("持仓响应格式异常，未启动组合。")
+        if any(not isinstance(row, dict) or _finite_decimal(row.get("pos"), "持仓数量") != 0
+               for row in positions):
+            raise ConnectionCheckError(f"{market.instrument} 已有模拟持仓。请在欧易模拟盘核对；向导不会平仓。")
+        if client.pending_orders(market.instrument) or client.pending_algo_orders(market.instrument):
+            raise ConnectionCheckError(f"{market.instrument} 已有普通挂单或策略单，请先在欧易模拟盘核对。")
+    return {"mode": "demo", "instruments": config.instruments,
+            "equity": equity, "available": available, "flat": True}
+
+
 @contextmanager
 def _stop_signals(stop: threading.Event):
     previous: dict[Any, Any] = {}
@@ -145,6 +191,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--config", type=Path, default=Path("config.paper.toml"), help="不含密钥的策略配置")
     result.add_argument("--state-dir", type=Path, default=Path(".runtime-demo"), help="仅存交易状态和日志，不保存密钥")
     result.add_argument("--check-only", action="store_true", help="只读检查后退出，不询问启动、不下单")
+    result.add_argument("--portfolio", action="store_true", help="BTC/ETH/SOL/XRP 四币 5m 组合，共享账户风控")
+    result.add_argument("--reconcile", action="store_true", help="与 --portfolio 合用：只读核对四币，安全更新已终结的恢复日志；不启动交易")
     return result
 
 
@@ -216,22 +264,40 @@ def _print_api_error(error: OkxError) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.reconcile and (not args.portfolio or args.check_only):
+            raise ConnectionCheckError("--reconcile 需要 --portfolio，且不能与 --check-only 同用。")
         print("欧易（OKX）模拟盘连接向导：仅支持模拟交易，没有实盘入口。")
         print("请使用模拟盘创建的 API；凭证不会显示、写入文件或保存到环境变量。")
         print("沿用当前终端的代理设置；请使用专用模拟账户。")
         try:
-            config = load_config(args.config)
+            config_path = (Path("config.portfolio.toml") if args.portfolio and args.config == Path("config.paper.toml")
+                           else args.config)
+            config = load_portfolio_config(config_path) if args.portfolio else load_config(config_path)
         except (OSError, ValueError, TypeError):
             print("无法读取策略配置。请确认配置文件存在且格式正确；未启动机器人。", file=sys.stderr)
             return 1
         credentials = collect_credentials()
         client = OkxClient(credentials)
-        summary = check_demo(config, client, progress=print)
-        print("只读检查通过：单向持仓、单币种保证金；当前合约无持仓、普通挂单或策略单。")
-        print(f"合约：{summary['instrument']}；模拟 USDT 权益：{summary['equity']}；可用：{summary['available']}。")
+        if args.reconcile:
+            from .portfolio import reconcile_portfolio
+            print("四币恢复核对：只查询交易所，满足条件后更新本地日志；不会下单、撤单或设置杠杆。")
+            result = reconcile_portfolio(config, args.state_dir, client=client)
+            if result.get("halted"):
+                print("恢复核对未通过，未解除日志阻止。请在欧易核对四币仓位、挂单和历史订单；不要删除日志。")
+                return 1
+            print("恢复核对完成，已终结的本地日志已更新；本次没有启动机器人。")
+            return 0
+        summary = (check_portfolio(config, client, progress=print) if args.portfolio
+                   else check_demo(config, client, progress=print))
+        print("只读检查通过：单向持仓、单币种保证金；所选合约无持仓、普通挂单或策略单。")
+        instruments = " / ".join(summary["instruments"]) if args.portfolio else summary["instrument"]
+        print(f"合约：{instruments}；模拟 USDT 权益：{summary['equity']}；可用：{summary['available']}。")
         print(f"当前策略：{config.bar} K 线，均线 {config.fast_window}/{config.slow_window}；"
               f"单笔名义金额上限 {config.max_notional} USDT；"
               f"风险预算 {config.risk_per_trade * 100}%；会话回撤阈值 {config.max_drawdown_pct * 100}%。")
+        if args.portfolio:
+            print(f"四币合计名义金额上限 {config.max_total_notional} USDT；"
+                  "账户权益与会话回撤只计算一次，每币独立等待新信号。")
         print("运行器会再次检查并设置 1×逐仓。停止程序或触发回撤阈值不会自动平掉已有模拟仓位；"
               "请在欧易模拟盘检查持仓及交易所止盈止损单。")
         if args.check_only:
@@ -247,7 +313,11 @@ def main(argv: list[str] | None = None) -> int:
         stop = threading.Event()
         print("开始自动模拟交易。按 Ctrl+C 请求停止；停止后请检查欧易模拟盘是否仍有持仓。")
         with _stop_signals(stop):
-            result = run_demo(config, args.state_dir, stop, client=client)
+            if args.portfolio:
+                from .portfolio import run_portfolio
+                result = run_portfolio(config, args.state_dir, stop, client=client)
+            else:
+                result = run_demo(config, args.state_dir, stop, client=client)
         if result.get("halted"):
             print("模拟交易程序已停止或启动被拒绝。请查看本机状态目录中的 status.json，"
                   "并核对欧易模拟盘持仓、挂单和止盈止损单；不要直接删除恢复日志。", file=sys.stderr)

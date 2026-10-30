@@ -25,26 +25,28 @@ INTERVAL = 900_000
 def dataset_fixture(config=None):
     """A complete one-day fixture, including real-schema funding anchors."""
     config = config or Config()
+    interval = backtest.bar_milliseconds(config.bar)
+    count = 86_400_000 // interval
     warmup = config.slow_window + 1
-    start = 96 * INTERVAL
-    end = start + 96 * INTERVAL
-    first = start - warmup * INTERVAL
+    start = 86_400_000
+    end = start + 86_400_000
+    first = start - warmup * interval
     pattern = [0, 300, 700, 1200, 700, 300, 0, -300, -700, -1200, -700, -300]
     candles = []
     previous = D(60_000)
-    for index in range(96 + warmup):
+    for index in range(count + warmup):
         close = D(60_000 + pattern[index % len(pattern)])
-        candles.append(Candle(first + index * INTERVAL, previous,
+        candles.append(Candle(first + index * interval, previous,
                               max(previous, close) + 10,
                               min(previous, close) - 10, close))
         previous = close
     instrument = Instrument(config.instrument, D(".01"), D(".01"),
-                            D(".01"), D(10000), D(".1"))
-    funding = [(start + offset * INTERVAL, D(".0001")) for offset in (0, 32, 64)]
+                            D(".01"), D(10000), D(".1"), config.instrument.split('-')[0])
+    funding = [(start + offset * 28_800_000, D(".0001")) for offset in (0, 1, 2)]
     return HistoryDataset(candles, list(candles), funding, instrument,
-                          start, end, end + INTERVAL,
+                          start, end, end + interval,
                           config.bar, warmup,
-                          (start - 32 * INTERVAL, D(".0001")),
+                          (start - 28_800_000, D(".0001")),
                           (end, D(".0001")))
 
 
@@ -135,6 +137,38 @@ class ReportOrchestrationTests(unittest.TestCase):
             open_pnl = D(result["open_position"]["net_pnl"]) if result["open_position"] else D(0)
             self.assertEqual(D(result["ending_equity"]) - D(result["initial_equity"]), closed + open_pnl)
 
+    def test_five_minute_split_uses_288_bars_and_does_not_leak_boundary_funding(self):
+        config = replace(self.config, bar="5m")
+        dataset = dataset_fixture(config)
+        interval = 300_000
+        split = dataset.start_ms + 201 * interval  # floor(288 * .7)
+        funding = sorted([*dataset.funding_rates, (split, D(".0002"))])
+        dataset = replace(dataset, funding_rates=funding)
+        with patch("okx_bot.backtest.run_backtest", side_effect=fake_result) as engine:
+            report = backtest.build_report(config, dataset, D(5000), "e" * 64)
+        self.assertEqual(report["source"]["bar"], "5m")
+        self.assertEqual(report["split"]["train_end_ms"], split)
+        self.assertEqual(engine.call_count, 4)
+        self.assertEqual((engine.call_args_list[1].kwargs["start_ms"], engine.call_args_list[1].kwargs["end_ms"]),
+                         (dataset.start_ms, split))
+        self.assertNotIn((split, D(".0002")), engine.call_args_list[1].args[3])
+        self.assertIn((split, D(".0002")), engine.call_args_list[2].args[3])
+        self.assertEqual(engine.call_args_list[2].kwargs["starting_equity"], D(5000))
+        self.assertEqual(engine.call_args_list[3].kwargs["fee_multiplier"], D(2))
+        self.assertIn("5 分钟 OHLC", " ".join(report["warnings"]))
+        self.assertNotIn("15 分钟 OHLC", " ".join(report["warnings"]))
+
+    def test_five_minute_reports_are_separate_per_market_not_aggregate_equity(self):
+        for instrument in ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP"):
+            with self.subTest(instrument=instrument):
+                config = replace(self.config, instrument=instrument, bar="5m")
+                report = backtest.build_report(config, dataset_fixture(config), D(5000), "f" * 64)
+                self.assertEqual(report["source"]["instrument"], instrument)
+                self.assertEqual(report["source"]["bar"], "5m")
+                self.assertEqual(report["results"]["test"]["initial_equity"], "5000")
+                self.assertIn("已收盘的5分钟", report["results"]["test"]["assumptions"][0])
+                self.assertNotIn("portfolio", report)
+
 
 class BacktestCommandTests(unittest.TestCase):
     def setUp(self):
@@ -188,6 +222,20 @@ class BacktestCommandTests(unittest.TestCase):
         self.assertEqual(fetch.call_count, 1)
         self.assertEqual(fetch.call_args.kwargs["days"], 30)
         load.assert_not_called()
+
+    def test_five_minute_saved_dataset_generates_offline_report_without_changing_default(self):
+        config = replace(Config(), bar="5m")
+        source = self.root / "source-5m.json"
+        save_dataset(dataset_fixture(config), source)
+        profile = self.root / "5m.toml"
+        profile.write_text('bar = "5m"\n', encoding="utf-8")
+        with patch("okx_bot.backtest.fetch_dataset", side_effect=AssertionError("offline must not fetch")):
+            code, _, error = self.invoke(["--config", str(profile), "--dataset", str(source)])
+        self.assertEqual(code, 0, error)
+        report = json.loads((self.state / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["source"]["bar"], "5m")
+        self.assertIn("5 分钟 OHLC", " ".join(report["warnings"]))
+        self.assertEqual(Config().bar, "15m")
 
     def test_invalid_capital_is_refused_before_any_download_or_file_output(self):
         for value in ("0", "-5", "NaN", "Infinity", "not-a-number"):

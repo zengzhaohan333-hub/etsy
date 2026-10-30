@@ -63,3 +63,14 @@ jobs:
             Write-Host "::error title=Windows diagnostic launcher integration::$message"
             exit 1
           }
+      - name: Verify portfolio demo launcher with a fake WSL process
+        shell: powershell
+        run: |
+          try {
+            .\tests\test_portfolio_launcher_windows.ps1
+          } catch {
+            $detail = $_.Exception.Message + "`n" + $_.InvocationInfo.PositionMessage
+            $message = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows portfolio launcher integration::$message"
+            exit 1
+          }

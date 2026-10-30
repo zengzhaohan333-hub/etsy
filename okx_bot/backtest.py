@@ -11,7 +11,7 @@ from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from .backtest_engine import run_backtest
+from .backtest_engine import SUPPORTED_BARS, run_backtest
 from .backtest_report import render_report
 from .config import Config, load_config
 from .core import bar_milliseconds
@@ -44,8 +44,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _validate_setup(config: Config, days: int, state_dir: Path) -> None:
-    if config.bar != "15m":
-        raise BacktestSetupError("本次历史验证仅支持 15m 周期。请保留正在验证的策略配置。")
+    if config.bar not in SUPPORTED_BARS:
+        raise BacktestSetupError("本次历史验证仅支持 5m 和 15m 周期。其他周期尚未验证。")
     if type(days) is not int or not 7 <= days <= 60:
         raise BacktestSetupError("历史下载范围必须是 7–60 天；默认 30 天。")
     if state_dir.resolve().name in {".runtime", ".runtime-demo"} or (state_dir / "demo-journal.json").exists():
@@ -60,6 +60,8 @@ def _snapshot_config(config: Config) -> dict:
 def build_report(config: Config, dataset: HistoryDataset, capital: Decimal,
                  dataset_sha256: str) -> dict:
     """Keep the predeclared parameters fixed for all chronological segments."""
+    if config.bar not in SUPPORTED_BARS:
+        raise BacktestSetupError("本次历史验证仅支持 5m 和 15m 周期。其他周期尚未验证。")
     if dataset.bar != config.bar or dataset.instrument.inst_id != config.instrument:
         raise BacktestSetupError("历史数据的合约或周期与当前策略配置不一致。")
     if dataset.warmup_bars < config.slow_window + 1:
@@ -86,7 +88,7 @@ def build_report(config: Config, dataset: HistoryDataset, capital: Decimal,
         "策略参数保持固定；前 70% 与后 30% 按时间划分，后段独立重置虚拟本金，不继承前段仓位。",
         "生产环境公开历史行情用于研究；欧易模拟盘的行情、成交与真实资金市场可能不同。",
         "使用当前合约规格快照，未重建历史规格变更；手续费是配置假设，并非账户实际费率。",
-        "15 分钟 OHLC 无法恢复盘中路径与盘口，标记价触发后的成交价格为近似；不能验证实盘可成交性。",
+        f"{interval // 60_000} 分钟 OHLC 无法恢复盘中路径与盘口，标记价触发后的成交价格为近似；不能验证实盘可成交性。",
         "回撤按 K 线开收盘及成交事件采样，可能遗漏盘中波动；未完整模拟清算、部分成交、延迟及断网。",
         "资金费覆盖按结算记录与不超过 8 小时间隔检查，无法据此证明所有历史结算记录均未遗漏。",
         "期末不强制平仓；总收益可能含未实现盈亏，尚未产生的平仓手续费没有计入。",

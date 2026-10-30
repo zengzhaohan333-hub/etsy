@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from okx_bot.backtest_engine import BAR_MS, run_backtest
 from okx_bot.config import Config
+from okx_bot.core import bar_milliseconds
 from okx_bot.okx import Candle, Instrument
 
 
@@ -35,20 +36,22 @@ def metadata(**changes):
     return replace(inst, **changes)
 
 
-def seed(prices=(100, 100, 100, 100)):
-    return [bar(START - (len(prices) - i) * BAR_MS, p) for i, p in enumerate(prices)]
+def seed(prices=(100, 100, 100, 100), *, interval=BAR_MS):
+    return [bar(START - (len(prices) - i) * interval, p) for i, p in enumerate(prices)]
 
 
 class BacktestTests(unittest.TestCase):
     def run_fixture(self, measured=None, *, marks=None, funding=None, signals=None,
                     config=None, instrument=None, warmup=None, **kwargs):
-        measured = measured or [bar(START + i * BAR_MS) for i in range(4)]
-        trade = (warmup if warmup is not None else seed()) + measured
-        mark = (warmup if warmup is not None else seed()) + (marks if marks is not None else measured)
+        config = config or base_config()
+        interval = bar_milliseconds(config.bar)
+        measured = measured or [bar(START + i * interval) for i in range(4)]
+        trade = (warmup if warmup is not None else seed(interval=interval)) + measured
+        mark = (warmup if warmup is not None else seed(interval=interval)) + (marks if marks is not None else measured)
         options = dict(starting_equity=D(1000), start_ms=START,
-                       end_ms=measured[-1].ts + BAR_MS, **kwargs)
+                       end_ms=measured[-1].ts + interval, **kwargs)
         def perform():
-            return run_backtest(config or base_config(), trade, mark, funding or [],
+            return run_backtest(config, trade, mark, funding or [],
                                 instrument or metadata(), **options)
         if signals is None:
             return perform()
@@ -66,6 +69,52 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(result['entries'], 1)
         self.assertEqual(result['open_position']['entry_time'], START + BAR_MS)
         self.assertEqual(D(result['open_position']['entry_price']), D(110))
+
+    def test_five_minute_sma_signal_executes_next_five_minute_open(self):
+        interval = 300_000
+        measured = [bar(START, 104, open_=102), bar(START + interval, 110)]
+        result = self.run_fixture(measured, config=base_config(bar='5m'),
+                                  warmup=seed((103, 102, 101, 102), interval=interval))
+        self.assertEqual(result['entries'], 1)
+        self.assertEqual(result['open_position']['entry_time'], START + interval)
+        self.assertEqual(D(result['open_position']['entry_price']), D(110))
+        self.assertEqual(result['end_ms'], START + 2 * interval)
+        self.assertEqual(max(point['ts'] for point in result['equity_curve']), result['end_ms'])
+        self.assertIn('已收盘的5分钟', result['assumptions'][0])
+        self.assertNotIn('15分钟', ' '.join(result['assumptions']))
+
+    def test_five_minute_intrabar_exit_uses_five_minute_end_timestamp(self):
+        interval = 300_000
+        measured = [bar(START), bar(START + interval, low=80, high=130)]
+        result = self.run_fixture(measured, config=base_config(bar='5m'), signals={START: 'long'})
+        self.assertEqual(result['trades'][0]['reason'], 'stop_loss')
+        self.assertEqual(result['trades'][0]['exit_time'], START + 2 * interval)
+        self.assertEqual(result['trades'][0]['exit_bar_ts'], START + interval)
+        self.assertEqual(result['trades'][0]['exit_time_precision'], 'bar')
+
+    def test_five_minute_funding_entry_and_exclusive_end_ordering(self):
+        interval = 300_000
+        measured = [bar(START + i * interval) for i in range(3)]
+        # The first event is settled before the same-time entry; the last is
+        # outside [start,end). Only the existing holder pays the middle event.
+        events = [(START + interval, D('.9')), (START + 2 * interval, D('.01')),
+                  (START + 3 * interval, D('.9'))]
+        result = self.run_fixture(measured, config=base_config(bar='5m'),
+                                  funding=events, signals={START: 'long'})
+        self.assertEqual(result['funding_events'], 2)
+        self.assertEqual(result['applied_funding_events'], 1)
+        self.assertEqual(D(result['funding_pnl']), D(-1))
+        self.assertEqual(D(result['open_position']['funding_pnl']), D(-1))
+
+    def test_five_minute_warmup_and_future_segment_cannot_create_entries(self):
+        interval = 300_000
+        c = base_config(bar='5m')
+        ordinary = seed(interval=interval) + [bar(START + i * interval) for i in range(3)]
+        arguments = dict(starting_equity=D(1000), start_ms=START, end_ms=START + 3 * interval)
+        expected = run_backtest(c, ordinary, ordinary, [], metadata(), **arguments)
+        outside = [Candle(START - 5 * interval, D('NaN'), D('NaN'), D('NaN'), D('NaN')),
+                   *ordinary, Candle(arguments['end_ms'], D('NaN'), D('NaN'), D('NaN'), D('NaN'))]
+        self.assertEqual(run_backtest(c, outside, outside, [], metadata(), **arguments), expected)
 
     def test_warmup_crossing_is_ignored(self):
         measured = [bar(START + i * BAR_MS, 103 + i) for i in range(3)]
@@ -257,7 +306,7 @@ class BacktestTests(unittest.TestCase):
 
     def test_interval_warmup_metadata_and_funding_validation(self):
         for config, start, end, funding, inst in (
-                (base_config(bar='5m'), START, START + 3 * BAR_MS, [], metadata()),
+                (base_config(bar='1m'), START, START + 3 * BAR_MS, [], metadata()),
                 (base_config(), START + 1, START + 3 * BAR_MS, [], metadata()),
                 (base_config(), START, START, [], metadata()),
                 (base_config(), START, START + 3 * BAR_MS, [(START + 1, D('.01'))], metadata()),
