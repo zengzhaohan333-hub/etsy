@@ -19,4 +19,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify launcher in Windows PowerShell with a fake WSL process
         shell: powershell
-        run: .\tests\test_launcher_windows.ps1
+        run: |
+          try {
+            .\tests\test_launcher_windows.ps1
+          } catch {
+            # The test uses only fake WSL/proxy data. Publish its controlled
+            # diagnostic as an annotation; never upload user credentials/logs.
+            $message = $_.Exception.Message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows launcher integration::$message"
+            exit 1
+          }
