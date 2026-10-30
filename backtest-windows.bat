@@ -13,7 +13,7 @@ set "OKX_BACKTEST_LAUNCHER=%~f0"
 powershell.exe -NoProfile -Command "try { $text = [IO.File]::ReadAllText($env:OKX_BACKTEST_LAUNCHER); $marker = '# OKX_BACKTEST_POWERSHELL_PAYLOAD'; $offset = $text.LastIndexOf($marker, [StringComparison]::Ordinal); if ($offset -lt 0) { throw 'Launcher payload is missing. Extract a fresh copy of the project.' }; & ([ScriptBlock]::Create($text.Substring($offset + $marker.Length))) } catch { Write-Host ('ERROR: ' + $_.Exception.Message); exit 1 }"
 set "OKX_BACKTEST_EXIT_CODE=%ERRORLEVEL%"
 echo.
-echo 回测窗口结束，退出代码：%OKX_BACKTEST_EXIT_CODE%。
+echo Backtest ended. Exit code: %OKX_BACKTEST_EXIT_CODE%.
 pause
 exit /b %OKX_BACKTEST_EXIT_CODE%
 

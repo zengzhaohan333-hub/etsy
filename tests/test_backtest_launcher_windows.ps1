@@ -216,8 +216,8 @@ Add-Type -TypeDefinition ([IO.File]::ReadAllText($SourcePath)) -Language CSharp 
     Assert-ProxyUnchanged $fixture
     Write-Host 'PASS: bare loopback proxy, quoted project path, one backtest invocation.'
 
-    # GitHub ZIP archives use the repository's LF form. Exercise that form as
-    # well as the CRLF checkout so the actual download remains usable.
+    # Exercise both LF copies and the attribute-defined CRLF form, so
+    # alternate source exports remain usable as well.
     $launcherText = [IO.File]::ReadAllText($launcher).Replace("`r`n", "`n")
     [IO.File]::WriteAllText($launcher, $launcherText, [Text.UTF8Encoding]::new($false))
     Set-ProxyFixture -Enabled 1 -Server 'http=127.0.0.1:10080;https=localhost:10090'

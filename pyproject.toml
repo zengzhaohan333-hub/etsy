@@ -13,4 +13,4 @@ dependencies = []
 okx-bot = "okx_bot.__main__:main"
 
 [tool.setuptools.package-data]
-okx_bot = ["dashboard.html"]
+okx_bot = ["dashboard.html", "monitor.html"]

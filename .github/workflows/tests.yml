@@ -41,3 +41,14 @@ jobs:
             Write-Host "::error title=Windows backtest launcher integration::$message"
             exit 1
           }
+      - name: Verify read-only demo monitor launcher with a fake WSL process
+        shell: powershell
+        run: |
+          try {
+            .\tests\test_monitor_launcher_windows.ps1
+          } catch {
+            $detail = $_.Exception.Message + "`n" + $_.InvocationInfo.PositionMessage
+            $message = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows monitor launcher integration::$message"
+            exit 1
+          }
