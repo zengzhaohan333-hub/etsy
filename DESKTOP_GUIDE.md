@@ -4,7 +4,7 @@
 
 ## 1. 下载并解压
 
-把运行包解压到 Windows 的「下载」文件夹，得到完整的 `okx-bot` 文件夹。打开后应能看到 `start-windows.bat`、`README.md`、`config.paper.toml` 和 `okx_bot` 子文件夹。不要直接在压缩包里运行，也不用把文件复制到 Linux 的主目录。
+把运行包解压到 Windows 的「下载」文件夹。GitHub ZIP 的顶层文件夹名称可能是 `etsy-delivery-okx-demo-bot`；打开后应能看到 `start-windows.bat`、`README.md`、`config.paper.toml` 和 `okx_bot` 子文件夹。启动文件与这些说明在同一层，不在 `okx_bot` 源码子目录内。请先解压再运行。
 
 程序需要 Python **3.11 或更高版本**，没有第三方运行依赖，不需要安装交易 SDK。
 
@@ -12,23 +12,23 @@
 
 当前版本依赖 Unix 文件锁，由启动器通过 **WSL 的 Ubuntu**运行；不需要安装 Windows 版 Python。
 
-如果尚未安装 WSL 和 Ubuntu 24.04，在管理员 PowerShell 中运行：
+如果尚未安装 WSL 和 Ubuntu，在管理员 PowerShell 中运行：
 
 ```powershell
-wsl --install -d Ubuntu-24.04
+wsl --install -d Ubuntu
 ```
 
-按系统提示安装、必要时重启，从开始菜单打开 Ubuntu 24.04，首次运行时设置本机 Linux 用户名和密码。
+按系统提示安装、必要时重启，从开始菜单打开 Ubuntu，首次运行时设置本机 Linux 用户名和密码。输入密码时不会显示字符或星号，输入完按回车，再输入一次确认。若发行版名称无效，先运行 `wsl --list --online`，使用列表中的实际名称。
 
-启动器使用 WSL 的默认发行版。在 PowerShell 中将它设为 Ubuntu 24.04：
+启动器使用 WSL 的默认发行版。在 PowerShell 中将它设为 Ubuntu：
 
 ```powershell
-wsl --set-default Ubuntu-24.04
+wsl --set-default Ubuntu
 ```
 
 这会改变 WSL 的默认发行版；如果你原来使用其他发行版，请留意此变化。
 
-在 Ubuntu 24.04 终端中检查 Python：
+在 Ubuntu 终端中检查 Python：
 
 ```bash
 python3 --version
@@ -45,7 +45,7 @@ sudo apt install python3
 
 ## 3. 打开本地模拟面板
 
-回到 Windows 的「下载」文件夹，打开解压后的 `okx-bot`，双击 **`start-windows.bat`**。
+回到 Windows 的「下载」文件夹，打开解压后包含启动文件的目录，双击 **`start-windows.bat`**。
 
 看到「本地模拟面板已启动」后，保持终端打开，在**同一台电脑**的浏览器地址栏输入：
 
@@ -65,8 +65,14 @@ http://127.0.0.1:8765
 
 本地电脑运行**不需要**发布聊天中的云环境配置；那份网络放行配置只影响云端机器。接交易所时，你的电脑需要能够正常访问 `www.okx.com`。
 
-在欧易的「模拟交易」账户创建专用 API，只开**读取、交易**权限。通过系统密钥管理器或安全的环境变量配置 `OKX_API_KEY`、`OKX_API_SECRET`、`OKX_API_PASSPHRASE`。不要把密钥写进终端命令历史、源码、聊天或截图；本程序不会自动读取 `.env`。
+在欧易网页登录自己的账户，进入 **交易 → 模拟交易**，在模拟交易页面寻找“模拟盘 API”或“创建模拟盘 API”入口（界面名称可能随版本变化）。名称可填 `okx-demo-bot`，权限只选**读取、交易**。保存 API Key、Secret Key，以及创建时自己设置的 Passphrase；它不是登录密码。
 
-凭证准备好后，先进行只读连接检查，再决定启动模拟盘订单。账户模式、命令和故障恢复步骤见 [README.md](README.md) 的「接入 OKX 模拟盘」与「订单与故障处理」；在自己的电脑执行命令时，工作目录应是解压后的项目目录，而不是云端的 `/workspace/etsy`。
+如果 Windows 已启用手动 HTTP 代理，双击同目录的 **`connect-okx-demo.bat`**。它读取现有代理地址、为 WSL 查找当前 Windows 主机地址，并打开连接向导。保持代理软件已连接。这个入口不修改代理、DNS、防火墙或系统环境变量；PAC 自动脚本和仅 SOCKS 代理需要另行配置。
 
-`start-windows.bat` 和面板只控制本地模拟，不会配置密钥或启动交易所订单。**停止模拟盘程序不会自动平掉交易所持仓。**
+向导会依次提示输入 API Key、Secret Key、Passphrase。**三项均为隐藏输入，屏幕不显示字符**；输入后回车。本程序仅在内存中使用这些输入，不把它们写入配置、日志或命令行。不要把凭证发到聊天或截图中。
+
+向导先只读核对账户、合约、余额、仓位和挂单。检查通过后，**直接回车即可结束检查**；只有明确输入完整的 `DEMO`，才会启动交易所模拟盘机器人。这个入口始终强制模拟盘，没有实盘入口。
+
+也可在已配置代理的 WSL 项目目录执行 `python3 -m okx_bot.connect --check-only`，仅检查后退出。已通过安全环境变量注入的 `OKX_API_KEY`、`OKX_API_SECRET`、`OKX_API_PASSPHRASE` 会复用，缺失项才提示输入。本程序不自动读取 `.env`。
+
+账户模式和故障恢复步骤见 [README.md](README.md) 的「接入 OKX 模拟盘」与「订单与故障处理」。**停止模拟盘程序不会自动平掉交易所持仓。** 原有 `start-windows.bat` 和网页面板继续只控制本地演示。
