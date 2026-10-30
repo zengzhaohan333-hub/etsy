@@ -18,7 +18,7 @@ import warnings
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import Config, load_config
 from .demo import run_demo
@@ -75,16 +75,20 @@ def _finite_decimal(value: Any, label: str) -> Decimal:
     return number
 
 
-def check_demo(config: Config, client: Any) -> dict[str, Any]:
+def check_demo(config: Config, client: Any, *,
+               progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     """Read-only checks. Never change account settings, orders or leverage."""
+    report = progress or (lambda _message: None)
+    report("正在检查欧易公共接口与系统时间（此请求不发送凭证）……")
+    server_ms = client.server_time()
+    if type(server_ms) is not int or abs(server_ms - time.time_ns() // 1_000_000) > 5_000:
+        raise ConnectionCheckError("电脑与欧易服务器的时间相差超过 5 秒，请先同步电脑时间。")
+    report("公共接口及时间检查通过，正在检查模拟盘 API……")
     account = client.account_config()
     if account.get("posMode") != "net_mode":
         raise ConnectionCheckError("模拟账户需要使用单向持仓模式（net_mode）。请先在欧易模拟盘切换，向导不会替你修改账户。")
     if str(account.get("acctLv")) != "2":
         raise ConnectionCheckError("模拟账户需要使用单币种保证金模式（acctLv=2）。请先在欧易模拟盘设置。")
-    server_ms = client.server_time()
-    if type(server_ms) is not int or abs(server_ms - time.time_ns() // 1_000_000) > 5_000:
-        raise ConnectionCheckError("电脑与欧易服务器的时间相差超过 5 秒，请先同步电脑时间。")
     instrument = client.instrument(config.instrument)
     if (instrument.inst_id != config.instrument or instrument.settle_ccy != "USDT"
             or instrument.ct_val_ccy != config.instrument.split("-")[0] or instrument.state != "live"):
@@ -138,6 +142,47 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def _print_api_error(error: OkxError) -> None:
+    """Display validated scalar diagnostics, never arbitrary remote messages."""
+    code = getattr(error, "api_code", None)
+    if not isinstance(code, str) or not re.fullmatch(r"[0-9]{1,12}", code):
+        # Keep compatibility with older adapters and controlled custom clients.
+        matched = re.fullmatch(r"OKX rejected request \(code ([0-9]{1,12})\)", str(error))
+        code = matched[1] if matched else None
+    status = getattr(error, "http_status", None)
+    http = f"（HTTP {status}）" if type(status) is int and 100 <= status <= 599 else ""
+    if code:
+        print(f"欧易模拟盘 API 返回错误代码 {code}{http}。", file=sys.stderr)
+        hints = {
+            "50101": "请确认使用的是在欧易【模拟交易】中创建的 API。",
+            "50102": "请检查 Windows 和 WSL 时间是否已同步。",
+            "50105": "请核对创建这组 API 时设置的 Passphrase；它不是欧易登录密码。",
+            "50110": "请核对 API 的 IP 白名单与当前请求的代理出口 IP 是否一致。保持原代理节点，先查询当前出口 IP，不要直接关闭白名单。",
+            "50111": "请重新核对模拟盘 API Key，并确认 API Key、Secret Key 来自同一组 API。",
+            "50113": "签名校验失败。请确认 API Key 与 Secret Key 来自同一组，并检查复制时是否混入多余字符。",
+            "50011": "请求过于频繁。请稍后再检查，避免同时打开多个连接向导。",
+        }
+        hint = hints.get(code, "请根据此错误代码核对欧易模拟盘 API 设置；不要发送密钥或完整响应。")
+    else:
+        print(f"欧易模拟盘请求未完成{http}。", file=sys.stderr)
+        hints = {
+            "credential_format": "凭证包含无法用于请求的字符。请使用 API 页面各字段旁的复制按钮，避免复制中文标签、换行或整个说明段落。",
+            "proxy": "代理服务器拒绝了连接或要求认证。请检查当前代理连接，暂时不要修改 API。",
+            "redirect": "请求返回重定向，程序已拒绝跳转。请核对官方 API 访问是否正常。",
+            "rate_limit": "请求过于频繁。请稍后重试连接检查，避免同时打开多个向导。",
+            "server": "服务端暂时不可用。请稍后重新进行连接检查。",
+            "timeout": "连接超时。请先检查当前代理是否仍连接，以及同一路径能否访问欧易公共接口。",
+            "tls": "HTTPS/TLS 连接校验或握手失败。请核对系统时间与网络连接，保留证书校验。",
+            "dns": "域名解析失败。请核对当前代理连接及公共接口访问情况。",
+            "invalid_response": "未收到有效的欧易 API 响应。请检查当前代理连接及公共接口访问情况。",
+            "http": "未收到可用的欧易错误码。请先检查当前代理访问公共接口的结果；仅凭此 HTTP 状态不能确认凭证是否正确。",
+        }
+        category = getattr(error, "category", None)
+        fallback = "请检查当前代理连接和欧易公共接口访问；当前信息不足以判断密钥、权限或白名单是否正确。"
+        hint = hints.get(category, fallback) if isinstance(category, str) else fallback
+    print(hint, file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -151,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         credentials = collect_credentials()
         client = OkxClient(credentials)
-        summary = check_demo(config, client)
+        summary = check_demo(config, client, progress=print)
         print("只读检查通过：单向持仓、单币种保证金；当前合约无持仓、普通挂单或策略单。")
         print(f"合约：{summary['instrument']}；模拟 USDT 权益：{summary['equity']}；可用：{summary['available']}。")
         print(f"当前策略：{config.bar} K 线，均线 {config.fast_window}/{config.slow_window}；"
@@ -183,17 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"无法继续：{error}", file=sys.stderr)
         return 1
     except OkxError as error:
-        # Only accept the adapter's exact numeric-code format, never echo an
-        # arbitrary exception or OKX's raw message/request authentication data.
-        code = re.fullmatch(r"OKX rejected request \(code ([0-9]{1,12})\)", str(error))
-        if code:
-            print(f"欧易模拟盘 API 返回错误代码 {code[1]}。", file=sys.stderr)
-            if code[1] == "50101":
-                print("请确认使用的是在欧易【模拟交易】中创建的 API。", file=sys.stderr)
-            elif code[1] == "50102":
-                print("请检查 Windows 和 WSL 时间是否已同步。", file=sys.stderr)
-        else:
-            print("欧易模拟盘请求未完成，请检查当前代理连接、模拟盘 API 权限和系统时间。", file=sys.stderr)
+        _print_api_error(error)
         return 1
     except (EOFError, KeyboardInterrupt):
         print("已取消。若此前已开始运行，请在欧易模拟盘检查是否仍有持仓及止盈止损单。")

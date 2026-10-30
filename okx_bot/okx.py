@@ -9,9 +9,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,9 +27,92 @@ from typing import Any, Callable, Mapping
 class OkxError(RuntimeError):
     """A sanitized exchange, configuration or transport error."""
 
+    _CATEGORIES = frozenset({"local", "api", "http", "redirect", "proxy", "rate_limit",
+                             "server", "timeout", "tls", "dns", "transport", "invalid_response",
+                             "credential_format"})
+
+    def __init__(self, message: str, *, api_code: Any = None,
+                 http_status: Any = None, category: str = "local") -> None:
+        super().__init__(message)
+        # Only safe scalars are attached. Never retain a response, URL, headers,
+        # body, remote message or original transport exception for diagnostics.
+        self.api_code = _safe_api_code(api_code)
+        self.http_status = _safe_http_status(http_status)
+        self.category = category if isinstance(category, str) and category in self._CATEGORIES else "local"
+
 
 class AmbiguousOrderError(OkxError):
     """An order request might have reached OKX. Reconcile; do not resend."""
+
+
+def _safe_api_code(value: Any) -> str | None:
+    if type(value) not in (str, int):
+        return None
+    text = str(value)
+    return text if re.fullmatch(r"[0-9]{1,12}", text) else None
+
+
+def _safe_http_status(value: Any) -> int | None:
+    return value if type(value) is int and 100 <= value <= 599 else None
+
+
+_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+_MAX_ERROR_BYTES = 64 * 1024
+
+
+def _http_diagnostics(status: Any, raw: Any) -> tuple[int | None, str | None, str]:
+    """Extract numeric diagnostics from a bounded error body, without its msg."""
+    http_status = _safe_http_status(status)
+    api_code = None
+    if isinstance(raw, (bytes, str)) and len(raw) <= _MAX_ERROR_BYTES:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                candidate = _safe_api_code(payload.get("code"))
+                # A body that resembles success never turns HTTP failure into
+                # success, or presents zero as an error code to the operator.
+                if candidate is not None and int(candidate) != 0:
+                    api_code = candidate
+        except (ValueError, TypeError, RecursionError):
+            pass
+    category = "http"
+    if http_status is not None:
+        if 300 <= http_status <= 399:
+            category = "redirect"
+        elif http_status == 407:
+            category = "proxy"
+        elif http_status == 429:
+            category = "rate_limit"
+        elif http_status >= 500:
+            category = "server"
+    return http_status, api_code, category
+
+
+def _http_failure(status: Any, raw: Any, *, order: bool) -> OkxError:
+    http_status, api_code, category = _http_diagnostics(status, raw)
+    if order:
+        return AmbiguousOrderError("Order HTTP response failed; reconcile using client order ID before continuing",
+                                   api_code=api_code, http_status=http_status, category=category)
+    if api_code is not None:
+        message = f"OKX rejected request (code {api_code})"
+    elif http_status is not None:
+        message = f"OKX HTTP request failed (HTTP {http_status})"
+    else:
+        message = "OKX HTTP request failed"
+    return OkxError(message, api_code=api_code, http_status=http_status, category=category)
+
+
+def _transport_category(error: BaseException) -> str:
+    # A URLError can wrap a typed socket exception or merely a string. Only
+    # inspect types; a reason string can contain proxy URLs and credentials.
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "timeout"
+    if isinstance(reason, ssl.SSLError):
+        return "tls"
+    if isinstance(reason, socket.gaierror):
+        return "dns"
+    return "transport"
 
 
 @dataclass(frozen=True, repr=False)
@@ -39,6 +125,10 @@ class Credentials:
         if not all(isinstance(v, str) and v.strip() for v in
                    (self.api_key, self.api_secret, self.passphrase)):
             raise OkxError("Missing OKX demo API credentials")
+        if any(not value.isascii() or any(ord(char) < 32 or ord(char) == 127 for char in value)
+               for value in (self.api_key, self.api_secret, self.passphrase)):
+            raise OkxError("OKX credential format is invalid; use ASCII values without control characters",
+                           category="credential_format")
 
     def __repr__(self) -> str:
         return "Credentials(<redacted>)"
@@ -158,28 +248,64 @@ class OkxClient:
         parsed = urllib.parse.urlsplit(request.full_url)
         if parsed.scheme != "https" or parsed.netloc != "www.okx.com":
             raise OkxError("OKX API host must be https://www.okx.com")
+        response_status = None
         try:
             with self._open(request, timeout=self.timeout) as response:
-                raw = response.read(4 * 1024 * 1024 + 1)
-                if len(raw) > 4 * 1024 * 1024:
-                    raise ValueError("Oversized response")
-                result = json.loads(raw)
-        except (OSError, urllib.error.URLError, ValueError, TimeoutError):
+                response_status = _safe_http_status(getattr(response, "status", None))
+                limit = _MAX_ERROR_BYTES if response_status is not None and not 200 <= response_status < 300 else _MAX_RESPONSE_BYTES
+                raw = response.read(limit + 1)
+        except urllib.error.HTTPError as error:
+            # HTTPError inherits URLError/OSError. Handle it first so an HTTP
+            # 400/401 JSON code is not erased as a generic connection failure.
+            status = _safe_http_status(error.code)
+            error_raw = None
+            try:
+                error_raw = error.read(_MAX_ERROR_BYTES + 1)
+            except (OSError, http.client.HTTPException, ValueError, TypeError):
+                pass
+            finally:
+                try:
+                    error.close()
+                except (OSError, ValueError):
+                    pass
+            raise _http_failure(status, error_raw, order=order) from None
+        except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError, TimeoutError) as error:
+            category = _transport_category(error)
             if order:
-                raise AmbiguousOrderError("Order response unavailable; reconcile using client order ID before continuing") from None
-            raise OkxError("OKX HTTPS request failed; check network, time and demo credentials") from None
-        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+                raise AmbiguousOrderError("Order response unavailable; reconcile using client order ID before continuing",
+                                          category=category) from None
+            raise OkxError("OKX HTTPS request failed; check network, time and demo credentials",
+                           category=category) from None
+        if response_status is not None and not 200 <= response_status < 300:
+            raise _http_failure(response_status, raw, order=order)
+        try:
+            if not isinstance(raw, (bytes, str)) or len(raw) > _MAX_RESPONSE_BYTES:
+                raise ValueError()
+            result = json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
             if order:
-                raise AmbiguousOrderError("Invalid order response; reconcile using client order ID")
-            raise OkxError("Invalid OKX API response")
-        code = str(result.get("code", "unknown"))
+                raise AmbiguousOrderError("Invalid order response; reconcile using client order ID",
+                                          category="invalid_response") from None
+            raise OkxError("Invalid OKX API response", category="invalid_response") from None
+        if not isinstance(result, dict):
+            if order:
+                raise AmbiguousOrderError("Invalid order response; reconcile using client order ID", category="invalid_response")
+            raise OkxError("Invalid OKX API response", category="invalid_response")
+        code = _safe_api_code(result.get("code"))
         if code != "0":
-            safe_code = code if re.fullmatch(r"[0-9]{1,12}", code) else "unknown"
-            if order and (code == "50004" or safe_code == "unknown"):
+            safe_code = code or "unknown"
+            if order and (code == "50004" or code is None):
                 # OKX documents 50004 as a timeout with an unknown order result.
-                raise AmbiguousOrderError("OKX order result unknown; reconcile using client order ID")
+                raise AmbiguousOrderError("OKX order result unknown; reconcile using client order ID",
+                                          api_code=code, http_status=response_status,
+                                          category="timeout" if code == "50004" else "invalid_response")
             # Do not echo the server's msg: it can contain request/credential data.
-            raise OkxError(f"OKX rejected request (code {safe_code})")
+            raise OkxError(f"OKX rejected request (code {safe_code})", api_code=code,
+                           http_status=response_status, category="api" if code else "invalid_response")
+        if not isinstance(result.get("data"), list):
+            if order:
+                raise AmbiguousOrderError("Invalid order response; reconcile using client order ID", category="invalid_response")
+            raise OkxError("Invalid OKX API response", category="invalid_response")
         return result["data"]
 
     def instrument(self, inst_id: str) -> Instrument:
@@ -326,16 +452,16 @@ class OkxClient:
                                           "tpOrdPx": "-1", "tpTriggerPxType": "mark"}]
         rows = self._request("POST", "/api/v5/trade/order", payload=payload, private=True, order=True)
         if len(rows) != 1 or not isinstance(rows[0], dict):
-            raise AmbiguousOrderError("Invalid order acknowledgement; reconcile using client order ID")
+            raise AmbiguousOrderError("Invalid order acknowledgement; reconcile using client order ID", category="invalid_response")
         row = rows[0]
-        if str(row.get("sCode", "unknown")) != "0":
-            code = str(row.get("sCode", "unknown"))
-            safe_code = code if re.fullmatch(r"[0-9]{1,12}", code) else "unknown"
-            if code == "50004" or safe_code == "unknown":
-                raise AmbiguousOrderError("OKX order result unknown; reconcile using client order ID")
-            raise OkxError(f"OKX rejected demo order (code {safe_code})")
+        code = _safe_api_code(row.get("sCode"))
+        if code != "0":
+            if code == "50004" or code is None:
+                raise AmbiguousOrderError("OKX order result unknown; reconcile using client order ID",
+                                          api_code=code, category="timeout" if code == "50004" else "invalid_response")
+            raise OkxError(f"OKX rejected demo order (code {code})", api_code=code, category="api")
         if not row.get("ordId") or row.get("clOrdId") != client_id:
-            raise AmbiguousOrderError("Order acknowledgement identity mismatch; reconcile using client order ID")
+            raise AmbiguousOrderError("Order acknowledgement identity mismatch; reconcile using client order ID", category="invalid_response")
         return row
 
     def query_order(self, inst_id: str, client_id: str) -> dict[str, Any]:

@@ -1,8 +1,11 @@
 import base64
 import hashlib
 import hmac
+import http.client
 import io
 import json
+import socket
+import ssl
 import unittest
 import urllib.error
 from decimal import Decimal
@@ -207,6 +210,201 @@ class OkxTests(unittest.TestCase):
     def test_default_transport_refuses_redirects(self):
         from okx_bot.okx import _NoRedirect
         self.assertIsNone(_NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://other.example"))
+
+    @staticmethod
+    def http_transport(status, body, *, headers=None):
+        failure = urllib.error.HTTPError("https://www.okx.com/api/v5/account/config?test-secret",
+            status, "test-passphrase", headers or {"X-Debug": "test-key"}, io.BytesIO(body))
+        return Transport(failure=failure)
+
+    def assert_safe_diagnostic(self, error):
+        # Operator-visible diagnostics and attached metadata must not retain the
+        # untrusted HTTP message, URL, headers or credential-bearing JSON body.
+        displayed = str(error) + repr(error) + repr(error.__dict__)
+        for sensitive in ("test-key", "test-secret", "test-passphrase"):
+            self.assertNotIn(sensitive, displayed)
+        self.assertEqual(set(error.__dict__), {"api_code", "http_status", "category"})
+
+    def test_http_authentication_error_preserves_only_numeric_code_and_status(self):
+        for status in (400, 401):
+            with self.subTest(status=status):
+                body = json.dumps({"code": "50101", "msg": "test-key test-secret test-passphrase"}).encode()
+                transport = self.http_transport(status, body)
+                with self.assertRaises(OkxError) as raised:
+                    self.client(transport).account_config()
+                error = raised.exception
+                self.assertEqual(error.api_code, "50101")
+                self.assertEqual(error.http_status, status)
+                self.assertEqual(error.category, "http")
+                self.assertEqual(str(error), "OKX rejected request (code 50101)")
+                self.assertEqual(len(transport.requests), 1)
+                self.assertEqual(dict((name.lower(), value) for name, value in transport.requests[0][0].header_items())["x-simulated-trading"], "1")
+                self.assert_safe_diagnostic(error)
+
+    def test_http_html_forbidden_does_not_echo_body_or_reason(self):
+        transport = self.http_transport(403, b"<html>test-secret test-passphrase test-key</html>")
+        with self.assertRaises(OkxError) as raised:
+            self.client(transport).account_config()
+        self.assertEqual(raised.exception.http_status, 403)
+        self.assertIsNone(raised.exception.api_code)
+        self.assertEqual(raised.exception.category, "http")
+        self.assert_safe_diagnostic(raised.exception)
+
+    def test_http_rate_limit_server_proxy_and_redirect_have_static_categories(self):
+        for status, category in ((429, "rate_limit"), (500, "server"), (502, "server"),
+                                 (503, "server"), (407, "proxy"), (301, "redirect"), (302, "redirect")):
+            with self.subTest(status=status):
+                transport = self.http_transport(status, b'{"code":"50011","msg":"test-secret"}',
+                    headers={"Location": "https://test-passphrase:pw@other.example/test-key"})
+                with self.assertRaises(OkxError) as raised:
+                    self.client(transport).account_config()
+                self.assertEqual(raised.exception.http_status, status)
+                self.assertEqual(raised.exception.category, category)
+                self.assertEqual(raised.exception.api_code, "50011")
+                self.assertEqual(len(transport.requests), 1)
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_http_response_that_claims_success_is_never_accepted(self):
+        body = b'{"code":"0","data":[{"acctLv":"2","posMode":"net_mode"}],"msg":"test-secret"}'
+        for status in (302, 401, 429, 500):
+            with self.subTest(status=status):
+                transport = self.http_transport(status, body)
+                with self.assertRaises(OkxError) as raised:
+                    self.client(transport).account_config()
+                self.assertIsNone(raised.exception.api_code)
+                self.assertEqual(raised.exception.http_status, status)
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_http_error_invalid_codes_and_json_only_keep_http_status(self):
+        bodies = [b"not JSON test-secret", b'{"code":"50101 test-secret","msg":"test-key"}',
+                  b'{"code":true}', b'{"code":null}', b'{"code":50101.0}',
+                  b'{"code":"1234567890123"}', b'{"code":"-50101"}',
+                  '{"code":"５０１０１"}'.encode(), b'["50101"]', b'{}', b'\xfftest-secret']
+        for body in bodies:
+            with self.subTest(body=body):
+                transport = self.http_transport(401, body)
+                with self.assertRaises(OkxError) as raised:
+                    self.client(transport).account_config()
+                self.assertIsNone(raised.exception.api_code)
+                self.assertEqual(raised.exception.http_status, 401)
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_http_error_body_read_is_bounded_and_closed(self):
+        class ObservedBody(io.BytesIO):
+            def read(self, size=-1):
+                self.requested_size = size
+                return super().read(size)
+        stream = ObservedBody(b'{"code":"50101","msg":"' + b"x" * 100_000 + b'"}')
+        error = urllib.error.HTTPError("https://www.okx.com", 401, "test-secret", {}, stream)
+        transport = Transport(failure=error)
+        with self.assertRaises(OkxError) as raised:
+            self.client(transport).account_config()
+        self.assertEqual(stream.requested_size, 64 * 1024 + 1)
+        self.assertTrue(stream.closed)
+        self.assertIsNone(raised.exception.api_code)
+        self.assertEqual(raised.exception.http_status, 401)
+        self.assert_safe_diagnostic(raised.exception)
+
+    def test_http_error_body_read_failure_still_keeps_status(self):
+        class BrokenBody(io.BytesIO):
+            def read(self, size=-1):
+                raise self.failure
+        for failure in (TimeoutError("test-secret"), http.client.IncompleteRead(b"test-secret")):
+            with self.subTest(failure=type(failure).__name__):
+                stream = BrokenBody()
+                stream.failure = failure
+                error = urllib.error.HTTPError("https://www.okx.com", 401, "test-passphrase", {}, stream)
+                with self.assertRaises(OkxError) as raised:
+                    self.client(Transport(failure=error)).account_config()
+                self.assertEqual(raised.exception.http_status, 401)
+                self.assertIsNone(raised.exception.api_code)
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_order_http_errors_always_remain_ambiguous_and_never_retry(self):
+        cases = [(401, b'{"code":"50101","msg":"test-secret"}'),
+                 (429, b'{"code":"50011","msg":"test-secret"}'),
+                 (500, b'{"code":"50004","msg":"test-secret"}'),
+                 (503, b'<html>test-secret</html>'),
+                 (302, b'{"code":"0","data":[{"sCode":"0","ordId":"123","clOrdId":"b1"}]}')]
+        for status, body in cases:
+            with self.subTest(status=status):
+                transport = self.http_transport(status, body)
+                with self.assertRaises(AmbiguousOrderError) as raised:
+                    self.client(transport).place_market_order("BTC-USDT-SWAP", "buy", "1", "b1", stop_loss="1", take_profit="2")
+                self.assertEqual(raised.exception.http_status, status)
+                self.assertEqual(len(transport.requests), 1)
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_success_status_business_error_without_data_retains_safe_code(self):
+        transport = Transport(raw=b'{"code":"50101","msg":"test-key test-secret test-passphrase"}')
+        with self.assertRaises(OkxError) as raised:
+            self.client(transport).account_config()
+        self.assertEqual(raised.exception.api_code, "50101")
+        self.assertEqual(raised.exception.category, "api")
+        self.assertEqual(str(raised.exception), "OKX rejected request (code 50101)")
+        self.assert_safe_diagnostic(raised.exception)
+
+    def test_invalid_and_oversized_success_response_remain_failures(self):
+        bodies = [b'test-secret', b'{"code":"0","data":null,"msg":"test-secret"}', b'[]', b"x" * (4 * 1024 * 1024 + 1)]
+        for body in bodies:
+            with self.subTest(size=len(body)):
+                transport = Transport(raw=body)
+                with self.assertRaises(OkxError) as raised:
+                    self.client(transport).account_config()
+                self.assertEqual(raised.exception.category, "invalid_response")
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_nonexception_http_error_response_cannot_bypass_status_check(self):
+        class ErrorResponse(io.BytesIO):
+            status = 401
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            return ErrorResponse(b'{"code":"0","data":[{"acctLv":"2"}]}')
+        with self.assertRaises(OkxError) as raised:
+            OkxClient(self.credentials, opener=opener).account_config()
+        self.assertEqual(raised.exception.http_status, 401)
+        self.assertEqual(len(calls), 1)
+
+    def test_typed_transport_failures_have_static_safe_categories(self):
+        failures = [(TimeoutError("test-secret"), "timeout"),
+                    (urllib.error.URLError(TimeoutError("test-passphrase")), "timeout"),
+                    (urllib.error.URLError(ssl.SSLCertVerificationError("test-secret")), "tls"),
+                    (urllib.error.URLError(socket.gaierror(-2, "test-key")), "dns"),
+                    (urllib.error.URLError("test-secret test-key"), "transport")]
+        for failure, category in failures:
+            with self.subTest(category=category):
+                transport = Transport(failure=failure)
+                with self.assertRaises(OkxError) as raised:
+                    self.client(transport).account_config()
+                self.assertEqual(raised.exception.category, category)
+                self.assertIsNone(raised.exception.api_code)
+                self.assertIsNone(raised.exception.http_status)
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_credential_control_and_non_ascii_characters_are_rejected_safely(self):
+        original = ["test-key", "test-secret", "test-passphrase"]
+        for index in range(3):
+            for suffix in ("\r", "\n", "\t", "\x00", "\x1f", "\x7f", "中文", "é"):
+                with self.subTest(index=index, suffix=repr(suffix)):
+                    values = original.copy()
+                    values[index] += suffix
+                    with self.assertRaises(OkxError) as raised:
+                        Credentials(*values)
+                    self.assertEqual(raised.exception.category, "credential_format")
+                    self.assert_safe_diagnostic(raised.exception)
+
+    def test_credential_values_preserve_legal_ascii_spaces_and_special_characters(self):
+        values = (" test-key ", " test-secret!@#$%^&*()_+-=[]{};:',./? ", " test-passphrase!@# ")
+        credentials = Credentials(*values)
+        self.assertEqual((credentials.api_key, credentials.api_secret, credentials.passphrase), values)
+
+    def test_safe_error_attributes_validate_input(self):
+        error = OkxError("Local message", api_code="test-secret", http_status="401", category="test-key")
+        self.assertIsNone(error.api_code)
+        self.assertIsNone(error.http_status)
+        self.assertEqual(error.category, "local")
+        self.assert_safe_diagnostic(error)
 
 
 if __name__ == "__main__":

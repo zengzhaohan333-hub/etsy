@@ -1,12 +1,14 @@
 import contextlib
 import getpass
 import io
+import json
 import os
 import signal
 import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import warnings
 from decimal import Decimal
 from pathlib import Path
@@ -15,7 +17,7 @@ from unittest.mock import Mock, patch
 
 from okx_bot import connect
 from okx_bot.config import Config
-from okx_bot.okx import Credentials, Instrument, OkxError
+from okx_bot.okx import Credentials, Instrument, OkxClient as RealOkxClient, OkxError
 
 
 ENV = {"OKX_API_KEY": "example-key-for-tests", "OKX_API_SECRET": "example-secret-for-tests",
@@ -259,6 +261,75 @@ class ConnectTests(unittest.TestCase):
         self.assertNotIn('50101', self.stderr.getvalue())
         self.assert_no_secrets_printed()
 
+    def test_http_auth_failure_reaches_wizard_as_safe_code_and_hint(self):
+        requests = []
+
+        def open_response(request, timeout):
+            requests.append(request)
+            if request.full_url.endswith('/public/time'):
+                return io.BytesIO(json.dumps({"code": "0", "data": [{"ts": str(time.time_ns() // 1_000_000)}]}).encode())
+            body = json.dumps({"code": "50110", "msg": ENV["OKX_API_SECRET"]}).encode()
+            raise urllib.error.HTTPError(request.full_url, 401, ENV["OKX_API_PASSPHRASE"], {}, io.BytesIO(body))
+
+        client = RealOkxClient(Credentials(*ENV.values()), opener=open_response)
+        with patch('okx_bot.connect.OkxClient', return_value=client):
+            self.assertEqual(self.invoke(), 1)
+        self.assertIn('50110', self.stderr.getvalue())
+        self.assertIn('HTTP 401', self.stderr.getvalue())
+        self.assertIn('白名单', self.stderr.getvalue())
+        self.assertIn('公共接口及时间检查通过', self.stdout.getvalue())
+        self.assertEqual(len(requests), 2)
+        public_headers = {name.lower() for name, _value in requests[0].header_items()}
+        self.assertFalse(any(name.startswith('ok-access-') for name in public_headers))
+        self.answer.assert_not_called()
+        self.runner.assert_not_called()
+        self.assert_no_secrets_printed()
+
+    def test_typed_credentials_errors_show_relevant_hint_without_remote_text(self):
+        os.environ.update(ENV)
+        for code, expected in (('50105', 'Passphrase'), ('50111', '同一组'), ('50113', '签名')):
+            with self.subTest(code=code):
+                error = OkxError(ENV['OKX_API_SECRET'])
+                error.api_code = code
+                error.http_status = 401
+                self.client.account_config = Mock(side_effect=error)
+                self.assertEqual(self.invoke(), 1)
+                self.assertIn(code, self.stderr.getvalue())
+                self.assertIn(expected, self.stderr.getvalue())
+        self.runner.assert_not_called()
+        self.assert_no_secrets_printed()
+
+    def test_unvalidated_diagnostic_attributes_are_not_echoed(self):
+        error = OkxError(ENV['OKX_API_SECRET'])
+        error.api_code = '50110 ' + ENV['OKX_API_SECRET']
+        error.http_status = ENV['OKX_API_KEY']
+        error.category = ENV['OKX_API_PASSPHRASE']
+        self.client.account_config = Mock(side_effect=error)
+        self.assertEqual(self.invoke(), 1)
+        self.assertNotIn('50110', self.stderr.getvalue())
+        self.assert_no_secrets_printed()
+
+    def test_public_timeout_is_reported_before_any_private_request(self):
+        error = OkxError(ENV['OKX_API_SECRET'])
+        error.category = 'timeout'
+        self.client.server_time = Mock(side_effect=error)
+        self.client.account_config = Mock()
+        self.assertEqual(self.invoke(), 1)
+        self.assertIn('连接超时', self.stderr.getvalue())
+        self.client.account_config.assert_not_called()
+        self.answer.assert_not_called()
+        self.runner.assert_not_called()
+        self.assert_no_secrets_printed()
+
+    def test_clock_skew_is_refused_before_signed_private_request(self):
+        self.client.server_ms = 0
+        self.client.account_config = Mock()
+        self.assertEqual(self.invoke(), 1)
+        self.assertIn('时间相差超过', self.stderr.getvalue())
+        self.client.account_config.assert_not_called()
+        self.runner.assert_not_called()
+        self.assert_no_secrets_printed()
+
     def test_unexpected_runner_exception_is_secret_free_and_restores_handlers(self):
         self.answer.return_value = "DEMO"
         self.runner.side_effect = RuntimeError(ENV["OKX_API_PASSPHRASE"])
@@ -295,7 +366,7 @@ class ConnectTests(unittest.TestCase):
     def test_readonly_check_uses_only_readonly_api_methods(self):
         summary = connect.check_demo(Config(), self.client)
         self.assertTrue(summary["flat"])
-        self.assertEqual(self.client.calls, ["account_config", "server_time", "instrument", "balances",
+        self.assertEqual(self.client.calls, ["server_time", "account_config", "instrument", "balances",
                                              "positions", "pending_orders", "pending_algo_orders"])
 
     def test_invalid_config_is_sanitized_before_any_credential_prompt(self):
