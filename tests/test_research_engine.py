@@ -80,6 +80,42 @@ class ResearchEngineTests(unittest.TestCase):
                 starting_equity=equity, start_ms=start, end_ms=end,
                 strategy_name=strategy, **options)
 
+    def run_low_turnover_fixture(self, *, count=4, signals=None, config=None,
+                                 measured=None, min_lot=None, **options):
+        measured = measured or {}
+        datasets = {market: history(market, measured.get(market,
+                    [bar(START + index * STEP) for index in range(count)])) for market in MARKETS}
+        if min_lot is not None:
+            datasets = {market: replace(dataset,
+                        instrument=replace(dataset.instrument, min_size=min_lot))
+                        for market, dataset in datasets.items()}
+        signals = signals or {}
+        instances = []
+
+        class ScheduledLowTurnover:
+            def __init__(self, *, fee_rate, slippage_rate):
+                self.market = MARKETS[len(instances)]
+                self.fee_rate = fee_rate
+                self.slippage_rate = slippage_rate
+                self.entries = []
+                instances.append(self)
+
+            def update(self, candle):
+                side = signals.get((self.market, candle.ts))
+                if side is None:
+                    return None
+                return SimpleNamespace(side=side, stop_loss_pct=D('.10'),
+                    take_profit_pct=D('.20'), atr=D(1), ready_at_ms=candle.ts + STEP)
+
+            def on_entry(self, ts_ms):
+                self.entries.append(ts_ms)
+
+        with patch('okx_bot.research_engine.LowTurnoverStrategy', ScheduledLowTurnover):
+            result = research_engine.run_portfolio_backtest(config or profile(), datasets,
+                starting_equity=D(5000), start_ms=START, end_ms=START + count * STEP,
+                strategy_name='low_turnover_v2', **options)
+        return result, instances
+
     @staticmethod
     def open_gross(result):
         return sum((D(position['quantity']) * D(position['mark_price'])
@@ -131,6 +167,104 @@ class ResearchEngineTests(unittest.TestCase):
         result = self.run_fixture(count=2, signals={(MARKETS[0], START + STEP): 'long'})
         self.assertEqual(result['entries'], 0)
         self.assertEqual(result['open_positions'], {})
+
+    def test_low_turnover_entry_hook_uses_fill_time_and_ignores_warmup_and_held_signals(self):
+        result, strategies = self.run_low_turnover_fixture(signals={
+            (MARKETS[1], START - STEP): 'long',
+            (MARKETS[0], START): 'long',
+            (MARKETS[0], START + STEP): 'short',
+            (MARKETS[0], START + 2 * STEP): 'long'})
+        self.assertEqual(result['entries'], 1)
+        self.assertEqual(strategies[0].entries, [START + STEP])
+        self.assertTrue(all(strategy.entries == [] for strategy in strategies[1:]))
+        self.assertEqual(result['open_positions'][MARKETS[0]]['side'], 'long')
+
+    def test_low_turnover_shared_cap_skips_do_not_start_other_markets_cooldowns(self):
+        result, strategies = self.run_low_turnover_fixture(
+            signals={(market, START): 'long' for market in MARKETS},
+            config=profile(max_total_notional=D(500)))
+        self.assertEqual(result['entries'], 1)
+        self.assertEqual(set(result['open_positions']), {MARKETS[0]})
+        self.assertEqual([strategy.entries for strategy in strategies],
+                         [[START + STEP], [], [], []])
+
+    def test_low_turnover_same_bar_stop_still_notifies_the_accepted_entry_once(self):
+        result, strategies = self.run_low_turnover_fixture(count=2,
+            measured={MARKETS[0]: [bar(START), bar(START + STEP, low=85)]},
+            signals={(MARKETS[0], START): 'long'})
+        self.assertEqual(result['entries'], 1)
+        self.assertEqual(result['open_positions'], {})
+        self.assertEqual(len(result['trades']), 1)
+        self.assertEqual(result['trades'][0]['reason'], 'stop_loss')
+        self.assertEqual(strategies[0].entries, [START + STEP])
+        self.assertTrue(all(strategy.entries == [] for strategy in strategies[1:]))
+
+    def test_low_turnover_minimum_lot_skips_and_final_close_signals_have_no_entry_hook(self):
+        for min_lot, signal_ts in ((D('1000000'), START), (None, START + STEP)):
+            with self.subTest(min_lot=min_lot, signal_ts=signal_ts):
+                result, strategies = self.run_low_turnover_fixture(count=2, min_lot=min_lot,
+                    signals={(market, signal_ts): 'long' for market in MARKETS})
+                self.assertEqual(result['entries'], 0)
+                self.assertEqual(result['open_positions'], {})
+                self.assertTrue(all(strategy.entries == [] for strategy in strategies))
+
+    def test_low_turnover_drawdown_skip_does_not_notify_unfilled_market(self):
+        measured = {MARKETS[0]: [bar(START), bar(START + STEP),
+                                 bar(START + 2 * STEP, 90), bar(START + 3 * STEP, 90)]}
+        result, strategies = self.run_low_turnover_fixture(measured=measured,
+            config=profile(max_drawdown_pct=D('.005')),
+            signals={(MARKETS[0], START): 'long', (MARKETS[1], START + STEP): 'long'})
+        self.assertTrue(result['halted'])
+        self.assertEqual(result['entries'], 1)
+        self.assertEqual(strategies[0].entries, [START + STEP])
+        self.assertTrue(all(strategy.entries == [] for strategy in strategies[1:]))
+
+    def test_low_turnover_gate_and_execution_use_multiplied_costs_above_live_config_cap(self):
+        result, strategies = self.run_low_turnover_fixture(count=2,
+            config=profile(fee_rate=D('.01'), slippage_rate=D('.001')),
+            signals={(MARKETS[0], START): 'long'}, fee_multiplier=D(2), slippage_multiplier=D(3))
+        self.assertEqual(result['entries'], 1)
+        self.assertTrue(all(strategy.fee_rate == D('.02') and strategy.slippage_rate == D('.003')
+                            for strategy in strategies))
+        self.assertEqual(D(result['fee_rate']), D('.02'))
+        self.assertEqual(D(result['slippage_rate']), D('.003'))
+        position = result['open_positions'][MARKETS[0]]
+        quantity, fill = D(position['quantity']), D(position['entry_price'])
+        self.assertEqual(fill, D('100.3'))
+        self.assertEqual(D(result['fees']), quantity * fill * D('.02'))
+        self.assertEqual(D(result['ending_equity']),
+                         D(5000) - quantity * fill * D('.02') + quantity * (D(100) - fill))
+
+    def test_existing_strategy_factories_keep_original_cost_config_under_stress(self):
+        datasets = {market: history(market, [bar(START), bar(START + STEP)]) for market in MARKETS}
+        config = profile(fee_rate=D('.01'), slippage_rate=D('.001'))
+        for name in ('sma_cross', 'trend_breakout_atr'):
+            with self.subTest(strategy=name):
+                seen = []
+
+                def make_strategy(strategy_name, market_config):
+                    seen.append((strategy_name, market_config))
+                    return SimpleNamespace(update=lambda candle: None)
+
+                with patch('okx_bot.research_engine._make_strategy', side_effect=make_strategy):
+                    result = research_engine.run_portfolio_backtest(config, datasets,
+                        starting_equity=D(5000), start_ms=START, end_ms=START + 2 * STEP,
+                        strategy_name=name, fee_multiplier=D(2), slippage_multiplier=D(3))
+                self.assertEqual(len(seen), 4)
+                self.assertTrue(all(strategy_name == name and market_config.fee_rate == D('.01')
+                    and market_config.slippage_rate == D('.001') for strategy_name, market_config in seen))
+                self.assertEqual(D(result['fee_rate']), D('.02'))
+                self.assertEqual(D(result['slippage_rate']), D('.003'))
+
+    def test_real_low_turnover_flat_history_has_no_entries(self):
+        datasets = {market: history(market, [bar(START + index * STEP) for index in range(24)])
+                    for market in MARKETS}
+        result = research_engine.run_portfolio_backtest(profile(), datasets,
+            starting_equity=D(5000), start_ms=START, end_ms=START + 24 * STEP,
+            strategy_name='low_turnover_v2')
+        self.assertEqual(result['entries'], 0)
+        self.assertEqual(result['open_positions'], {})
+        self.assertEqual(D(result['ending_equity']), D(5000))
 
     @staticmethod
     def sma_histories():

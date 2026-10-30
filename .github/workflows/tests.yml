@@ -85,3 +85,14 @@ jobs:
             Write-Host "::error title=Windows research launcher integration::$message"
             exit 1
           }
+      - name: Verify cached low-turnover research launcher with a fake WSL process
+        shell: powershell
+        run: |
+          try {
+            .\tests\test_research_low_turnover_launcher_windows.ps1
+          } catch {
+            $detail = $_.Exception.Message + "`n" + $_.InvocationInfo.PositionMessage
+            $message = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows offline research launcher integration::$message"
+            exit 1
+          }

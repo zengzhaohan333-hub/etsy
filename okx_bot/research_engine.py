@@ -16,6 +16,7 @@ from .backtest_engine import _json_safe, _positive, _validate_candles
 from .core import CrossStrategy, position_size, protection_prices
 from .history import FUNDING_MAX_GAP_MS, HistoryDataset
 from .portfolio_config import PortfolioConfig
+from .research_low_turnover_signals import LowTurnoverStrategy
 from .research_signals import HourlyBreakoutStrategy, Signal
 
 
@@ -45,6 +46,9 @@ def _make_strategy(strategy_name: str, config: Any) -> Any:
         return _SmaSignals(config)
     if strategy_name == "trend_breakout_atr":
         return HourlyBreakoutStrategy()
+    if strategy_name == "low_turnover_v2":
+        return LowTurnoverStrategy(fee_rate=config.fee_rate,
+                                   slippage_rate=config.slippage_rate)
     raise ValueError("Unknown research strategy")
 
 
@@ -140,7 +144,7 @@ def run_portfolio_backtest(profile: PortfolioConfig, datasets: dict[str, History
     """Replay all four instruments on a common clock and a single 1x wallet."""
     if not isinstance(profile, PortfolioConfig) or profile.bar != "5m":
         raise ValueError("A validated four-market 5m profile is required")
-    if strategy_name not in {"sma_cross", "trend_breakout_atr"}:
+    if strategy_name not in {"sma_cross", "trend_breakout_atr", "low_turnover_v2"}:
         raise ValueError("Unknown research strategy")
     if (type(start_ms) is not int or type(end_ms) is not int or start_ms < WARMUP_BARS * BAR_MS
             or start_ms >= end_ms or start_ms % BAR_MS or end_ms % BAR_MS):
@@ -157,7 +161,15 @@ def run_portfolio_backtest(profile: PortfolioConfig, datasets: dict[str, History
         raise ValueError("Exactly the four configured histories are required")
     configs = {config.instrument: config for config in profile.market_configs()}
     prepared = {symbol: _prepare(datasets[symbol], symbol, start_ms, end_ms) for symbol in symbols}
-    strategies = {symbol: _make_strategy(strategy_name, configs[symbol]) for symbol in symbols}
+    strategies = {}
+    for symbol in symbols:
+        strategy_config = configs[symbol]
+        if strategy_name == "low_turnover_v2":
+            # The cost gate must see this scenario's multiplied costs. Do not
+            # revalidate a Config copy: stress rates may exceed its live cap.
+            strategy_config = SimpleNamespace(**dict(vars(strategy_config),
+                                                     fee_rate=fee_rate, slippage_rate=slip_rate))
+        strategies[symbol] = _make_strategy(strategy_name, strategy_config)
     for symbol in symbols:
         for candle in prepared[symbol][0][:WARMUP_BARS]:
             strategies[symbol].update(candle)
@@ -295,6 +307,10 @@ def run_portfolio_backtest(profile: PortfolioConfig, datasets: dict[str, History
                 entries += 1
                 per_market[symbol]["entries"] += 1
                 per_market[symbol]["fees"] += entry_fee
+                if strategy_name == "low_turnover_v2":
+                    # Only an actual fill consumes a daily slot and cooldown;
+                    # warm-up, pending signals and rejected sizes never do.
+                    strategies[symbol].on_entry(ts)
                 sample(ts, "entry")
         pending = {}
         for symbol in symbols:
@@ -372,6 +388,12 @@ def run_portfolio_backtest(profile: PortfolioConfig, datasets: dict[str, History
                   "使用720根已收盘5分钟K线预热；预热信号忽略。测量期收盘信号在紧接下一根成交价K线开盘估算成交，ATR止损比例在信号收盘时冻结。",
                   f"基线使用SMA{profile.fast_window}/{profile.slow_window}交叉和固定{profile.stop_loss_pct * 100}%止损、{profile.take_profit_pct * 100}%止盈；候选使用已完成整点小时趋势、5分钟突破和ATR保护，参数事先固定，不按结果寻优。",
                   "候选趋势为已完成小时SMA20/50且小时收盘在SMA50同侧；突破为5分钟收盘首次越过此前20根高低点，ATR14用Wilder平滑，止损为1.5ATR/收盘且至少0.5%，原始比例超过3%则跳过，止盈为止损的2倍。",
+                  *([
+                      "低频V2在原候选上增加固定门槛：已完成小时SMA20相对3小时前的斜率须同向，突破须至少超过此前20根高低点0.25ATR。",
+                      "低频V2用当前成本场景的2×(费率+滑点率)估算往返成本，要求(止盈比例-往返成本)/(止损比例+往返成本)至少1.5；双倍成本场景也重新检查此门槛。",
+                      "低频V2每币只对实际模拟入场计数：按UTC+8每天最多2次，两次实际入场至少间隔6小时；持仓、余额或风险限制跳过的信号不占用次数，不补追旧信号。",
+                      "低频V2是在已经查看过的数据上提出的开发候选；本次比较不构成未触碰样本外验证，也不自动修改正在运行的策略。"
+                  ] if strategy_name == "low_turnover_v2" else []),
                   "每币最多一个1倍逐仓仓位；不加仓、不反手，持仓期间信号忽略。新信号批次轮换四币优先顺序，不补追未执行信号。",
                   "可用余额保守取现金减入场1倍保证金、以及当前权益减标记总名义额的较小值；未实现盈利不用于再次开仓。合约数量按当前规格向下取整。",
                   "开仓同时受每币和共享绝对名义额上限约束，多空不抵消。数量测算使用成交开盘价和标记开盘价较高者及不利滑点；价格变化超限不强制减仓。",

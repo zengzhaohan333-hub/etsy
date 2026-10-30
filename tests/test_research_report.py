@@ -149,6 +149,49 @@ class ResearchReportTests(unittest.TestCase):
         self.assertNotIn('Infinity', html)
         self.assertIn('— / 日', html)
 
+    def test_seen_development_data_is_not_presented_as_untouched_validation(self):
+        report = fixture()
+        report['scenarios'] = [report['scenarios'][0], report['scenarios'][2], copy.deepcopy(report['scenarios'][2])]
+        report['scenarios'][2].update(id='low_turnover_v2_200', strategy='low_turnover_v2', label='低频候选V2 / 200')
+        report['validation'] = {'status': 'development_seen',
+                                'label': '开发复盘：历史区间已用于策略设计，后30%不再是独立样本外验证',
+                                'frozen_at_ms': 0, 'unseen_validation_required': True}
+        report['candidate_definition'] = {'新突破窗口': '55根', '冷却期': '24根'}
+        html = render_research_report(report)
+        for label in ('全区间开发复盘', '前70%开发复盘', '后30%开发复盘', '后段双倍成本开发压力'):
+            with self.subTest(label=label):
+                self.assertEqual(html.count(label), 6)  # three scenarios, metrics and daily tables
+        for text in ('开发复盘 · 已见历史数据', '本轮规则冻结记录：1970-01-01 08:00',
+                     '此前未查看的新数据或后续模拟记录', '后段开发复盘共享账户权益轨迹',
+                     '后段表现不再是独立样本外证据', '低频候选 V2（待验证）', '55根', '24根',
+                     '不能把三组本金或收益相加'):
+            with self.subTest(text=text):
+                self.assertIn(text, html)
+        self.assertNotIn('规则在读取结果前固定', html)
+        self.assertNotIn('未按后段表现寻优', html)
+        self.assertNotIn('5m 已收盘价对先前 20 根高低区间', html)
+        self.assertNotIn('<th scope="row">全样本', html)
+        self.assertNotIn('<th scope="row">后 30%', html)
+
+    def test_default_report_keeps_original_split_labels_and_frozen_rule_description(self):
+        html = render_research_report(fixture())
+        self.assertIn('规则在读取结果前固定', html)
+        self.assertIn('未按后段表现寻优', html)
+        self.assertIn('<th scope="row">全样本', html)
+        self.assertIn('<th scope="row">后 30%', html)
+        self.assertNotIn('class="panel notice validation"', html)
+        self.assertNotIn('后30%开发复盘', html)
+
+    def test_validation_metadata_is_escaped_without_active_elements(self):
+        report = fixture()
+        payload = '<script>alert("bad")</script>'
+        report['validation'] = {'status': 'development_seen', 'label': payload,
+                                'frozen_at_ms': payload, 'unseen_validation_required': True}
+        html = render_research_report(report)
+        self.assertIn('&lt;script&gt;alert(&quot;bad&quot;)&lt;/script&gt;', html)
+        self.assertNotIn(payload, html)
+        self.assertTrue(all(tag != 'script' for tag, _ in Parsed(html).tags))
+
 
 if __name__ == '__main__':
     unittest.main()

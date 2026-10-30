@@ -54,6 +54,18 @@ python3 -m okx_bot.research --days 30 --capital 5000 --daily-target 200
 python3 -m okx_bot.research --days 30 --dataset-dir .runtime-research/datasets --state-dir .runtime-research-replay
 ```
 
+上一轮结果已经看过后，下一轮降低换手的研究请使用 **`research-low-turnover-windows.bat`**。完整解压新版后双击，在文件选择框选中上一轮 **`.runtime-research/datasets/BTC-USDT-SWAP.json`**；同一目录须保留 ETH、SOL、XRP 的三个 JSON。工具离线复用四币缓存，无需重新下载、代理或密钥；已有模拟仓位不影响复盘。结果另存到 **`.runtime-research-v2/report.html`** 和 **`summary.json`**，旧报告、缓存及交易程序保持原样。
+
+新入口只比较原均线、上一轮突破候选及一个固定低换手候选，三者均保留单币 200U。四币共享 1,000U 入场预算上限，四币各一仓的 200U 上限实际合计至多 800U。低换手规则额外要求：完整小时 SMA20 相对三小时前同向、突破幅度至少 0.25 ATR、扣除往返费用与滑点后的估算收益风险比至少 1.5；同币成功入场之间至少 6 小时，北京时间每币每天最多两次。跳过、预算不足或未成交信号不占名额，不追补旧信号。所有参数固定，不搜索最赚钱的一组。
+
+双倍成本用实际放大后的费用和滑点重新筛选，所以交易序列可能改变。默认费率和滑点下，成本门槛相当于止损距离至少 0.7%；双倍成本时至少 1.4%，因此可能很少或没有交易。零交易、少量交易或开发段盈利均不能证明稳健。每币每天两次最多合计八次新入场，按每笔 200U、每笔 2% 毛收益举例也只有 32U，尚未扣费且未计亏损；这只是金额示例，不是自然日日盈亏上限或收益预测。
+
+**这段历史已参与新规则设计，全区间、原前 70% 和后 30% 都属于开发资料。** 新报告明确标为“开发复盘”，记录规则冻结时间，并要求再用新的未见区间及后续模拟验证；不能把重跑同一后段称为新的样本外验证。每天 200U 仍只是观察阈值，不驱动下单或加仓，不会自动替换当前策略。
+
+```bash
+python3 -m okx_bot.research_low_turnover --dataset-dir /path/to/previous/.runtime-research/datasets
+```
+
 以下旧入口仍是单币研究：
 
 Windows 已配置手动 HTTP 代理时，双击 **`backtest-windows.bat`**。它使用公开接口下载最近 30 天的成交价 K 线、标记价格 K 线和历史资金费率，不读取 API 密钥，不下单，不修改正在运行的模拟盘。各段虚拟本金为 5,000 USDT；下载完成后生成并打开 `.runtime-backtest/report.html`。
