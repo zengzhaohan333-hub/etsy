@@ -36,12 +36,14 @@ def mark_row(ts):
 
 
 class FakeHistoryClient:
-    def __init__(self, config=CONFIG, days=1):
+    def __init__(self, config=CONFIG, days=1, warmup_bars=None):
         self.metadata = [instrument_row()]
-        self.end = NOW // INTERVAL * INTERVAL
+        interval = history.INTERVALS[config.bar]
+        self.end = NOW // interval * interval
         self.start = self.end - days * history.DAY_MS
-        self.first = self.start - (config.slow_window + 1) * INTERVAL
-        timestamps = list(range(self.first, self.end, INTERVAL))
+        warmup = config.slow_window + 1 if warmup_bars is None else warmup_bars
+        self.first = self.start - warmup * interval
+        timestamps = list(range(self.first, self.end, interval))
         self.trade = [trade_row(ts) for ts in reversed(timestamps)]
         self.mark = [mark_row(ts) for ts in reversed(timestamps)]
         funding_first = self.start - self.start % history.FUNDING_MAX_GAP_MS - history.FUNDING_MAX_GAP_MS
@@ -75,9 +77,9 @@ class HistoryTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.path = Path(self.temp.name) / "history.json"
 
-    def fetch(self):
+    def fetch(self, config=CONFIG, *, warmup_bars=None):
         with patch("okx_bot.history.PublicHistoryClient", return_value=self.client), patch("okx_bot.history._now_ms", return_value=NOW + 10_000):
-            return history.fetch_dataset(CONFIG, days=1, now_ms=NOW)
+            return history.fetch_dataset(config, days=1, now_ms=NOW, warmup_bars=warmup_bars)
 
     def write_payload(self, payload):
         payload["snapshot"].pop("sha256", None)
@@ -121,6 +123,38 @@ class HistoryTests(unittest.TestCase):
     def test_fetch_allows_identical_pagination_overlap(self):
         self.client.overlap = True
         self.assertEqual(len(self.fetch().trade_candles), 117)
+
+    def test_explicit_research_warmup_covers_sixty_hours_and_survives_offline_cache(self):
+        config = replace(CONFIG, bar="5m")
+        self.client = FakeHistoryClient(config, warmup_bars=720)
+        data = self.fetch(config, warmup_bars=720)
+        self.assertEqual(data.warmup_bars, 720)
+        self.assertEqual(data.start_ms - data.trade_candles[0].ts, 60 * 3_600_000)
+        self.assertEqual(len(data.trade_candles), 288 + 720)
+        self.assertEqual(len(data.mark_candles), 288 + 720)
+        self.assertTrue(all(data.start_ms <= ts < data.end_ms for ts, _rate in data.funding_rates))
+        history.save_dataset(data, self.path)
+        with patch("okx_bot.history.PublicHistoryClient", side_effect=AssertionError("cache is offline")):
+            self.assertEqual(history.load_dataset(self.path), data)
+
+    def test_largest_explicit_warmup_is_supported_and_cache_still_revalidates(self):
+        self.client = FakeHistoryClient(warmup_bars=1200)
+        data = self.fetch(warmup_bars=1200)
+        self.assertEqual(data.warmup_bars, 1200)
+        history.save_dataset(data, self.path)
+        self.assertEqual(history.load_dataset(self.path), data)
+        payload = json.loads(self.path.read_bytes())
+        payload["snapshot"]["warmup_bars"] = 1201
+        self.write_payload(payload)
+        with self.assertRaises(history.HistoryError):
+            history.load_dataset(self.path)
+
+    def test_invalid_explicit_warmup_fails_before_any_network_client(self):
+        for count in (True, False, 0, -1, 20, 1201, 720.0, "720"):
+            with self.subTest(count=count), patch("okx_bot.history.PublicHistoryClient") as client:
+                with self.assertRaises(history.HistoryError):
+                    history.fetch_dataset(CONFIG, days=1, now_ms=NOW, warmup_bars=count)
+                client.assert_not_called()
 
     def test_missing_or_unconfirmed_trade_or_mark_bar_rejected(self):
         for field in ("trade", "mark"):
@@ -316,6 +350,31 @@ class PublicTransportTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertIn("503", str(raised.exception))
         self.assertNotIn("diagnostic-secret", str(raised.exception))
+
+    def test_readonly_maintenance_codes_retry_at_most_three_without_remote_message(self):
+        for code in ("50001", "50013"):
+            for recover in (True, False):
+                with self.subTest(code=code, recover=recover):
+                    calls, notices = [], []
+                    def opener(request, timeout):
+                        calls.append(request)
+                        payload = ({"code": "0", "data": []} if recover and len(calls) == 3
+                                   else {"code": code, "msg": "diagnostic-secret API-key fake-secret"})
+                        return Response(json.dumps(payload).encode())
+                    client = history.PublicHistoryClient(opener=opener, sleep=lambda _: None, progress=notices.append)
+                    if recover:
+                        self.assertEqual(self.get(client), [])
+                    else:
+                        with self.assertRaises(history.HistoryError) as raised:
+                            self.get(client)
+                        self.assertIn(code, str(raised.exception))
+                        self.assertNotIn("diagnostic-secret", str(raised.exception))
+                        self.assertNotIn("fake-secret", str(raised.exception))
+                    self.assertEqual(len(calls), 3)
+                    self.assertEqual(len(notices), 2)
+                    self.assertNotIn("diagnostic-secret", " ".join(notices))
+                    self.assertNotIn("fake-secret", " ".join(notices))
+                    self.assertTrue(all(request.get_method() == "GET" for request in calls))
 
     def test_redirect_and_error_http_body_claiming_success_are_not_accepted(self):
         for status in (302, 401, 403):

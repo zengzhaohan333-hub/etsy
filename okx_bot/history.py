@@ -47,6 +47,7 @@ FUNDING_COVERAGE_RULE = "preceding_anchor_and_nonempty_events_with_gaps_at_most_
 MAX_CACHE_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_BARS = 200_000
+MAX_WARMUP_BARS = 1200
 MAX_TIMESTAMP_MS = 32_503_680_000_000
 
 
@@ -203,9 +204,9 @@ class PublicHistoryClient:
             payload = _json(raw)
             code = _numeric_code(payload)
             if code != "0":
-                if code in {"50011", "50004"} and attempt + 1 < self.max_attempts:
+                if code in {"50001", "50004", "50011", "50013"} and attempt + 1 < self.max_attempts:
                     if self._progress:
-                        self._progress("公开历史接口暂时限流或超时，将有限重试。")
+                        self._progress("公开历史接口暂时限流或不可用，将有限重试。")
                     self._sleep(attempt + 1)
                     continue
                 suffix = f"（代码 {code}）" if code else ""
@@ -334,7 +335,7 @@ def _validate(dataset: HistoryDataset) -> None:
     if (start >= end or start % interval or end % interval or end > retrieved
             or not DAY_MS <= end - start <= 90 * DAY_MS or (end - start) % DAY_MS):
         raise HistoryError("历史快照测量区间或抓取时间无效。")
-    if type(dataset.warmup_bars) is not int or not 3 <= dataset.warmup_bars <= 201:
+    if type(dataset.warmup_bars) is not int or not 3 <= dataset.warmup_bars <= MAX_WARMUP_BARS:
         raise HistoryError("历史快照预热 K 线数量无效。")
     expected = (end - start) // interval + dataset.warmup_bars
     if expected > MAX_BARS:
@@ -379,7 +380,8 @@ def _validate(dataset: HistoryDataset) -> None:
 
 
 def fetch_dataset(config: Config, days: int = 30, now_ms: int | None = None,
-                  progress: Callable[[str], Any] | None = None) -> HistoryDataset:
+                  progress: Callable[[str], Any] | None = None, *,
+                  warmup_bars: int | None = None) -> HistoryDataset:
     if type(days) is not int or not 1 <= days <= 90:
         raise HistoryError("历史回测天数必须是 1 到 90 的整数。")
     inst_id = _inst_id(config.instrument)
@@ -388,7 +390,10 @@ def fetch_dataset(config: Config, days: int = 30, now_ms: int | None = None,
     interval = INTERVALS[config.bar]
     now = _timestamp(_now_ms() if now_ms is None else now_ms)
     end = now // interval * interval
-    start, warmup = end - days * DAY_MS, config.slow_window + 1
+    warmup = config.slow_window + 1 if warmup_bars is None else warmup_bars
+    if type(warmup) is not int or not config.slow_window + 1 <= warmup <= MAX_WARMUP_BARS:
+        raise HistoryError("历史预热 K 线数量必须至少满足策略窗口，且不超过 1200。")
+    start = end - days * DAY_MS
     first = start - warmup * interval
     if first < 0 or (end - first) // interval > MAX_BARS:
         raise HistoryError("历史回测起点或数据量超出支持范围。")
