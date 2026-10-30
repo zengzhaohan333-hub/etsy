@@ -89,7 +89,7 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $projectPath 'okx_bot\connect.py') -PathType Leaf)) {
         throw 'The credential wizard is missing. Extract the entire updated project, then run this launcher from that folder.'
     }
-    $wslCommand = Get-Command 'wsl.exe' -CommandType Application -ErrorAction SilentlyContinue
+    $wslCommand = Get-Command 'wsl.exe' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $wslCommand) {
         throw 'WSL was not found. Install WSL with Ubuntu, then see DESKTOP_GUIDE.md. This launcher needs no administrator privileges.'
     }

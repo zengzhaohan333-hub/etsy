@@ -25,7 +25,8 @@ jobs:
           } catch {
             # The test uses only fake WSL/proxy data. Publish its controlled
             # diagnostic as an annotation; never upload user credentials/logs.
-            $message = $_.Exception.Message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            $detail = $_.Exception.Message + "`n" + $_.InvocationInfo.PositionMessage
+            $message = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=Windows launcher integration::$message"
             exit 1
           }

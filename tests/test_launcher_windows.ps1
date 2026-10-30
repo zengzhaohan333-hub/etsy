@@ -195,7 +195,7 @@ Add-Type -TypeDefinition ([IO.File]::ReadAllText($SourcePath)) -Language CSharp 
     $env:PATH = $binaryDirectory + ';' + $env:PATH
     $env:OKX_TEST_CAPTURE = Join-Path $temporary 'arguments.txt'
     $env:OKX_TEST_CALLS = Join-Path $temporary 'calls.txt'
-    $resolvedWsl = (Get-Command wsl.exe -CommandType Application).Source
+    $resolvedWsl = (Get-Command wsl.exe -CommandType Application | Select-Object -First 1).Source
     Assert-True ($resolvedWsl -ieq $fakeWsl) 'Fake WSL must be first on PATH; refusing to test against real WSL.'
 
     Set-ProxyFixture -Enabled 1 -Server '127.0.0.1:10090'
