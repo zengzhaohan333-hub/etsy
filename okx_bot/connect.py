@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import ipaddress
 import os
 import re
 import signal
@@ -153,16 +154,32 @@ def _print_api_error(error: OkxError) -> None:
     http = f"（HTTP {status}）" if type(status) is int and 100 <= status <= 599 else ""
     if code:
         print(f"欧易模拟盘 API 返回错误代码 {code}{http}。", file=sys.stderr)
+        request_ip = None
+        candidate = getattr(error, "request_ip", None)
+        if code == "50110" and isinstance(candidate, str) and re.fullmatch(r"[0-9A-Fa-f:.]{2,45}", candidate):
+            try:
+                address = ipaddress.ip_address(candidate)
+                if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+                    address = address.ipv4_mapped
+                request_ip = str(address)
+            except ValueError:
+                pass
+        if request_ip is not None:
+            print(f"欧易在本次请求中报告的来源 IP：{request_ip}。", file=sys.stderr)
+        elif code == "50110":
+            print("欧易本次响应未提供可识别的来源 IP，程序没有猜测地址。", file=sys.stderr)
         hints = {
             "50101": "请确认使用的是在欧易【模拟交易】中创建的 API。",
             "50102": "请检查 Windows 和 WSL 时间是否已同步。",
             "50105": "请核对创建这组 API 时设置的 Passphrase；它不是欧易登录密码。",
-            "50110": "请核对 API 的 IP 白名单与当前请求的代理出口 IP 是否一致。保持原代理节点，先查询当前出口 IP，不要直接关闭白名单。",
+            "50110": "请核对当前 API 的 IP 白名单与本次请求来源 IP。其他网站查询到的代理出口可能不同；并请在本机确认输入的 API Key 属于正在查看的这组 API。",
             "50111": "请重新核对模拟盘 API Key，并确认 API Key、Secret Key 来自同一组 API。",
             "50113": "签名校验失败。请确认 API Key 与 Secret Key 来自同一组，并检查复制时是否混入多余字符。",
             "50011": "请求过于频繁。请稍后再检查，避免同时打开多个连接向导。",
         }
         hint = hints.get(code, "请根据此错误代码核对欧易模拟盘 API 设置；不要发送密钥或完整响应。")
+        if code == "50110" and request_ip is not None:
+            hint = "请将上方来源 IP 与当前 API 白名单对照。若不同，请先核对代理出口；若相同，请在本机重新核对输入的 API Key 是否属于这组 API。"
     else:
         print(f"欧易模拟盘请求未完成{http}。", file=sys.stderr)
         hints = {

@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -32,13 +33,15 @@ class OkxError(RuntimeError):
                              "credential_format"})
 
     def __init__(self, message: str, *, api_code: Any = None,
-                 http_status: Any = None, category: str = "local") -> None:
+                 http_status: Any = None, category: str = "local",
+                 request_ip: Any = None) -> None:
         super().__init__(message)
         # Only safe scalars are attached. Never retain a response, URL, headers,
         # body, remote message or original transport exception for diagnostics.
         self.api_code = _safe_api_code(api_code)
         self.http_status = _safe_http_status(http_status)
         self.category = category if isinstance(category, str) and category in self._CATEGORIES else "local"
+        self.request_ip = _safe_request_ip(request_ip) if self.api_code == "50110" else None
 
 
 class AmbiguousOrderError(OkxError):
@@ -56,14 +59,38 @@ def _safe_http_status(value: Any) -> int | None:
     return value if type(value) is int and 100 <= value <= 599 else None
 
 
+def _safe_request_ip(value: Any) -> str | None:
+    """Validate a lone IP literal; never accept zones, CIDR, ports or context."""
+    if type(value) is not str or not re.fullmatch(r"[0-9A-Fa-f:.]{2,45}", value):
+        return None
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return str(address)
+
+
+def _request_ip_from_message(api_code: Any, message: Any) -> str | None:
+    """Accept only complete, known OKX 50110 English whitelist templates."""
+    if api_code != "50110" or type(message) is not str or len(message) > 256:
+        return None
+    matched = re.fullmatch(
+        r"Your IP(?: address)? ([0-9A-Fa-f:.]{2,45}) is not included in your API key's IP whitelist\.?",
+        message)
+    return _safe_request_ip(matched[1]) if matched else None
+
+
 _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _MAX_ERROR_BYTES = 64 * 1024
 
 
-def _http_diagnostics(status: Any, raw: Any) -> tuple[int | None, str | None, str]:
+def _http_diagnostics(status: Any, raw: Any) -> tuple[int | None, str | None, str, str | None]:
     """Extract numeric diagnostics from a bounded error body, without its msg."""
     http_status = _safe_http_status(status)
     api_code = None
+    request_ip = None
     if isinstance(raw, (bytes, str)) and len(raw) <= _MAX_ERROR_BYTES:
         try:
             payload = json.loads(raw)
@@ -73,6 +100,7 @@ def _http_diagnostics(status: Any, raw: Any) -> tuple[int | None, str | None, st
                 # success, or presents zero as an error code to the operator.
                 if candidate is not None and int(candidate) != 0:
                     api_code = candidate
+                    request_ip = _request_ip_from_message(api_code, payload.get("msg"))
         except (ValueError, TypeError, RecursionError):
             pass
     category = "http"
@@ -85,21 +113,23 @@ def _http_diagnostics(status: Any, raw: Any) -> tuple[int | None, str | None, st
             category = "rate_limit"
         elif http_status >= 500:
             category = "server"
-    return http_status, api_code, category
+    return http_status, api_code, category, request_ip
 
 
 def _http_failure(status: Any, raw: Any, *, order: bool) -> OkxError:
-    http_status, api_code, category = _http_diagnostics(status, raw)
+    http_status, api_code, category, request_ip = _http_diagnostics(status, raw)
     if order:
         return AmbiguousOrderError("Order HTTP response failed; reconcile using client order ID before continuing",
-                                   api_code=api_code, http_status=http_status, category=category)
+                                   api_code=api_code, http_status=http_status, category=category,
+                                   request_ip=request_ip)
     if api_code is not None:
         message = f"OKX rejected request (code {api_code})"
     elif http_status is not None:
         message = f"OKX HTTP request failed (HTTP {http_status})"
     else:
         message = "OKX HTTP request failed"
-    return OkxError(message, api_code=api_code, http_status=http_status, category=category)
+    return OkxError(message, api_code=api_code, http_status=http_status, category=category,
+                    request_ip=request_ip)
 
 
 def _transport_category(error: BaseException) -> str:
@@ -301,7 +331,8 @@ class OkxClient:
                                           category="timeout" if code == "50004" else "invalid_response")
             # Do not echo the server's msg: it can contain request/credential data.
             raise OkxError(f"OKX rejected request (code {safe_code})", api_code=code,
-                           http_status=response_status, category="api" if code else "invalid_response")
+                           http_status=response_status, category="api" if code else "invalid_response",
+                           request_ip=_request_ip_from_message(code, result.get("msg")))
         if not isinstance(result.get("data"), list):
             if order:
                 raise AmbiguousOrderError("Invalid order response; reconcile using client order ID", category="invalid_response")

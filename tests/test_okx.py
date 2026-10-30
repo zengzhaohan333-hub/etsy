@@ -223,7 +223,7 @@ class OkxTests(unittest.TestCase):
         displayed = str(error) + repr(error) + repr(error.__dict__)
         for sensitive in ("test-key", "test-secret", "test-passphrase"):
             self.assertNotIn(sensitive, displayed)
-        self.assertEqual(set(error.__dict__), {"api_code", "http_status", "category"})
+        self.assertEqual(set(error.__dict__), {"api_code", "http_status", "category", "request_ip"})
 
     def test_http_authentication_error_preserves_only_numeric_code_and_status(self):
         for status in (400, 401):
@@ -405,6 +405,101 @@ class OkxTests(unittest.TestCase):
         self.assertIsNone(error.http_status)
         self.assertEqual(error.category, "local")
         self.assert_safe_diagnostic(error)
+
+    def test_whitelist_request_ip_uses_complete_known_50110_messages_in_both_paths(self):
+        cases = [
+            ("Your IP 65.75.221.17 is not included in your API key's IP whitelist.", "65.75.221.17"),
+            ("Your IP address 65.75.221.17 is not included in your API key's IP whitelist", "65.75.221.17"),
+            ("Your IP 2001:0DB8:0000:0000:0000:0000:0000:0001 is not included in your API key's IP whitelist.", "2001:db8::1"),
+            ("Your IP ::FFFF:65.75.221.17 is not included in your API key's IP whitelist.", "65.75.221.17"),
+        ]
+        for message, expected in cases:
+            for http_error in (False, True):
+                with self.subTest(message=message, http_error=http_error):
+                    body = json.dumps({"code": "50110", "msg": message,
+                                       "debug": "test-key test-secret test-passphrase"}).encode()
+                    transport = self.http_transport(401, body) if http_error else Transport(raw=body)
+                    with self.assertRaises(OkxError) as raised:
+                        self.client(transport).account_config()
+                    self.assertEqual(raised.exception.api_code, "50110")
+                    self.assertEqual(raised.exception.request_ip, expected)
+                    self.assertEqual(str(raised.exception), "OKX rejected request (code 50110)")
+                    self.assertNotIn(message, str(raised.exception))
+                    self.assert_safe_diagnostic(raised.exception)
+
+    def test_whitelist_request_ip_is_not_extracted_from_arbitrary_context(self):
+        template = "Your IP 65.75.221.17 is not included in your API key's IP whitelist."
+        messages = [
+            "test-secret 65.75.221.17 test-key", "IP: 65.75.221.17", "test-passphrase " + template,
+            template + " test-secret", template + "\n", "\n" + template, template + "\r\n",
+            template + " " + template, template.lower(), template.replace("Your IP", "Your ip"),
+            template.replace("65.75.221.17", "test-secret"),
+            template.replace("65.75.221.17", "65.75.221.17,192.0.2.1"),
+            template.replace("65.75.221.17", "65.75.221.17 192.0.2.1"),
+            template.replace("65.75.221.17", "256.75.221.17"),
+            template.replace("65.75.221.17", "065.75.221.17"),
+            template.replace("65.75.221.17", "65.75.221.17:443"),
+            template.replace("65.75.221.17", "65.75.221.17/32"),
+            template.replace("65.75.221.17", "fe80::1%eth0"),
+            template.replace("65.75.221.17", "[2001:db8::1]"),
+            template.replace("65.75.221.17", "2001:db8::1/128"),
+            template.replace("65.75.221.17", "1"),
+            template.replace("65.75.221.17", "２００１:db8::1"),
+            "x" * 1000 + template, None, 50110, {"ip": "65.75.221.17"},
+        ]
+        for message in messages:
+            for http_error in (False, True):
+                with self.subTest(message=message, http_error=http_error):
+                    body = json.dumps({"code": "50110", "msg": message}).encode()
+                    transport = self.http_transport(401, body) if http_error else Transport(raw=body)
+                    with self.assertRaises(OkxError) as raised:
+                        self.client(transport).account_config()
+                    self.assertEqual(raised.exception.api_code, "50110")
+                    self.assertIsNone(raised.exception.request_ip)
+                    self.assert_safe_diagnostic(raised.exception)
+
+    def test_whitelist_request_ip_requires_exact_code_50110(self):
+        message = "Your IP 65.75.221.17 is not included in your API key's IP whitelist."
+        for code in ("50101", "50111", "050110", "50110 test-secret", None):
+            for http_error in (False, True):
+                with self.subTest(code=code, http_error=http_error):
+                    body = json.dumps({"code": code, "msg": message}).encode()
+                    transport = self.http_transport(401, body) if http_error else Transport(raw=body)
+                    with self.assertRaises(OkxError) as raised:
+                        self.client(transport).account_config()
+                    self.assertIsNone(raised.exception.request_ip)
+                    self.assert_safe_diagnostic(raised.exception)
+
+    def test_whitelist_request_ip_is_not_parsed_from_oversized_http_error_body(self):
+        body = json.dumps({"code": "50110", "msg": "Your IP 65.75.221.17 is not included in your API key's IP whitelist.",
+                           "padding": "x" * 100_000}).encode()
+        with self.assertRaises(OkxError) as raised:
+            self.client(self.http_transport(401, body)).account_config()
+        self.assertIsNone(raised.exception.api_code)
+        self.assertIsNone(raised.exception.request_ip)
+        self.assert_safe_diagnostic(raised.exception)
+
+    def test_error_constructor_revalidates_request_ip_and_code(self):
+        for value in ("65.75.221.17 test-secret", "test-key", "fe80::1%eth0", "65.75.221.17/32",
+                      "65.75.221.17\n", "65.75.221.17,192.0.2.1", 657522117, None):
+            with self.subTest(value=value):
+                error = OkxError("Controlled message", api_code="50110", request_ip=value)
+                self.assertIsNone(error.request_ip)
+                self.assert_safe_diagnostic(error)
+        error = OkxError("Controlled message", api_code="50111", request_ip="65.75.221.17")
+        self.assertIsNone(error.request_ip)
+        error = OkxError("Controlled message", api_code="50110", request_ip="::ffff:65.75.221.17")
+        self.assertEqual(error.request_ip, "65.75.221.17")
+        self.assert_safe_diagnostic(error)
+
+    def test_whitelist_ip_on_order_http_failure_stays_ambiguous_without_retry(self):
+        body = json.dumps({"code": "50110", "msg": "Your IP 65.75.221.17 is not included in your API key's IP whitelist."}).encode()
+        transport = self.http_transport(401, body)
+        with self.assertRaises(AmbiguousOrderError) as raised:
+            self.client(transport).place_market_order("BTC-USDT-SWAP", "buy", "1", "b1", stop_loss="1", take_profit="2")
+        self.assertEqual(raised.exception.request_ip, "65.75.221.17")
+        self.assertEqual(len(transport.requests), 1)
+        self.assert_safe_diagnostic(raised.exception)
 
 
 if __name__ == "__main__":

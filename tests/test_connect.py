@@ -268,7 +268,9 @@ class ConnectTests(unittest.TestCase):
             requests.append(request)
             if request.full_url.endswith('/public/time'):
                 return io.BytesIO(json.dumps({"code": "0", "data": [{"ts": str(time.time_ns() // 1_000_000)}]}).encode())
-            body = json.dumps({"code": "50110", "msg": ENV["OKX_API_SECRET"]}).encode()
+            body = json.dumps({"code": "50110",
+                "msg": "Your IP 8.8.4.4 is not included in your API key's IP whitelist.",
+                "ignored": ENV["OKX_API_SECRET"]}).encode()
             raise urllib.error.HTTPError(request.full_url, 401, ENV["OKX_API_PASSPHRASE"], {}, io.BytesIO(body))
 
         client = RealOkxClient(Credentials(*ENV.values()), opener=open_response)
@@ -277,12 +279,35 @@ class ConnectTests(unittest.TestCase):
         self.assertIn('50110', self.stderr.getvalue())
         self.assertIn('HTTP 401', self.stderr.getvalue())
         self.assertIn('白名单', self.stderr.getvalue())
+        self.assertIn('欧易在本次请求中报告的来源 IP：8.8.4.4', self.stderr.getvalue())
         self.assertIn('公共接口及时间检查通过', self.stdout.getvalue())
         self.assertEqual(len(requests), 2)
         public_headers = {name.lower() for name, _value in requests[0].header_items()}
         self.assertFalse(any(name.startswith('ok-access-') for name in public_headers))
         self.answer.assert_not_called()
         self.runner.assert_not_called()
+        self.assert_no_secrets_printed()
+
+    def test_source_ip_is_revalidated_and_normalized_before_display(self):
+        error = OkxError(ENV['OKX_API_SECRET'])
+        error.api_code = '50110'
+        error.request_ip = '::ffff:8.8.4.4'
+        connect._print_api_error(error)
+        self.assertIn('来源 IP：8.8.4.4', self.stderr.getvalue())
+        self.assertNotIn('::ffff', self.stderr.getvalue())
+        self.assert_no_secrets_printed()
+
+    def test_source_ip_is_not_displayed_for_invalid_values_or_other_codes(self):
+        cases = [('50110', ENV['OKX_API_SECRET']), ('50110', '8.8.4.4 ' + ENV['OKX_API_KEY']),
+                 ('50110', '2001:4860::1%eth0'), ('50110', '8.8.4.4/24'),
+                 ('50110', '8.8.4.4:443'), ('50110', None), ('50101', '8.8.4.4')]
+        for code, request_ip in cases:
+            with self.subTest(code=code, request_ip=request_ip):
+                error = OkxError(ENV['OKX_API_SECRET'])
+                error.api_code = code
+                error.request_ip = request_ip
+                connect._print_api_error(error)
+        self.assertNotIn('报告的来源 IP：', self.stderr.getvalue())
         self.assert_no_secrets_printed()
 
     def test_typed_credentials_errors_show_relevant_hint_without_remote_text(self):
