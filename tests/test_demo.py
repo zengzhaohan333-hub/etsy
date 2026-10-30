@@ -1,5 +1,6 @@
 import hashlib
 import json
+import copy
 import tempfile
 import threading
 import unittest
@@ -12,7 +13,7 @@ from unittest.mock import patch
 from okx_bot import demo
 from okx_bot.config import Config
 from okx_bot.core import CrossStrategy
-from okx_bot.okx import AmbiguousOrderError, Candle, Credentials, Instrument
+from okx_bot.okx import AmbiguousOrderError, Candle, Credentials, Instrument, OkxError
 
 
 D = Decimal
@@ -38,6 +39,26 @@ class Signals:
 
     def update(self, candle):
         return "long"
+
+
+class NoSleepStop:
+    """Event-shaped virtual stop: records backoff without sleeping."""
+    def __init__(self, *, stop_on_wait=False):
+        self.stopped = False
+        self.stop_on_wait = stop_on_wait
+        self.waits = []
+
+    def is_set(self):
+        return self.stopped
+
+    def set(self):
+        self.stopped = True
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        if self.stop_on_wait:
+            self.stopped = True
+        return self.stopped
 
 
 class FakeClient:
@@ -141,12 +162,169 @@ class DemoTests(unittest.TestCase):
     def journal(self):
         return json.loads((self.state / "demo-journal.json").read_text())
 
+    def run_with_statuses(self, cycles=1, stop=None):
+        snapshots = []
+        original = demo._save
+        def save(path, contents):
+            original(path, contents)
+            if path.name == "status.json":
+                snapshots.append(copy.deepcopy(contents))
+        with patch("okx_bot.demo._save", side_effect=save):
+            result = self.run_bot(cycles, stop=stop or NoSleepStop())
+        return result, snapshots
+
+    @staticmethod
+    def connection_states(snapshots):
+        values = []
+        for state in snapshots:
+            connection = state.get("connection")
+            values.append(connection.get("state") if isinstance(connection, dict) else connection)
+        return values
+
     def test_no_historical_entry_and_repeated_bar_has_no_order(self):
         self.client.add_new = False
         result = self.run_bot(3)
         self.assertFalse(result["halted"])
         self.assertEqual(self.client.place_calls, 0)
         self.assertEqual(result["entries"], 0)
+
+    def test_transient_balance_read_recovers_and_publishes_recovery_without_orders(self):
+        self.client.add_new = False
+        original = self.client.balances
+        calls = []
+        def temporary_failure():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OkxError("Temporary read timeout", category="timeout")
+            return original()
+        self.client.balances = temporary_failure
+        stop = NoSleepStop()
+        result, snapshots = self.run_with_statuses(stop=stop)
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(len(calls), 3)  # failed seed read, retry, successful cycle
+        self.assertEqual(self.client.place_calls, 0)
+        self.assertEqual(self.client.leverage_calls, 1)
+        self.assertEqual(stop.waits, [2])
+        states = self.connection_states(snapshots)
+        retry = states.index("retrying")
+        checking = states.index("checking", retry + 1)
+        self.assertIn("connected", states[checking + 1:])
+        self.assertEqual(result["phase"], "stopped")
+        self.assertEqual(result["last_success_at_ms"], NOW)
+
+    def test_three_balance_read_failures_halt_at_cap_and_preserve_journal(self):
+        self.client.add_new = False
+        journal_path = self.state / "demo-journal.json"
+        original_journal = '{"version":1,"orders":[{"status":"closed","marker":"preserve"}]}'
+        journal_path.write_text(original_journal)
+        calls = []
+        def unavailable():
+            calls.append(1)
+            raise OkxError("Temporary read timeout", category="timeout")
+        self.client.balances = unavailable
+        stop = NoSleepStop()
+        result = self.run_bot(3, stop=stop)
+        self.assertTrue(result["halted"])
+        self.assertEqual(result["phase"], "halted")
+        self.assertEqual(result["halt_category"], "timeout")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(stop.waits, [2, 4])
+        self.assertEqual(self.client.leverage_calls, 0)
+        self.assertEqual(self.client.place_calls, 0)
+        self.assertEqual(journal_path.read_text(), original_journal)
+
+    def test_leverage_write_transport_failure_is_attempted_only_once(self):
+        def failed_write(_inst_id, _leverage):
+            self.client.leverage_calls += 1
+            raise OkxError("Leverage response unavailable", category="timeout")
+        self.client.set_leverage = failed_write
+        stop = NoSleepStop()
+        result = self.run_bot(3, stop=stop)
+        self.assertTrue(result["halted"])
+        self.assertEqual(self.client.leverage_calls, 1)
+        self.assertEqual(self.client.place_calls, 0)
+        self.assertEqual(stop.waits, [])
+
+    def test_ambiguous_order_write_with_transient_category_never_retries(self):
+        def failed_write(*_args, **_kwargs):
+            self.client.place_calls += 1
+            self.assertEqual(self.journal()["orders"][-1]["status"], "intent")
+            raise AmbiguousOrderError("Order response unavailable", category="timeout")
+        self.client.place_market_order = failed_write
+        stop = NoSleepStop()
+        result = self.run_bot(3, stop=stop)
+        self.assertTrue(result["halted"])
+        self.assertEqual(self.client.place_calls, 1)
+        self.assertEqual(stop.waits, [])
+        self.assertEqual(self.journal()["orders"][-1]["status"], "inspect_required")
+
+    def test_fill_query_read_retry_recovers_without_resubmitting_order(self):
+        original = self.client.query_order
+        queries = []
+        def temporary_failure(*args):
+            queries.append(1)
+            if len(queries) == 1:
+                raise OkxError("Temporary order read timeout", category="timeout")
+            return original(*args)
+        self.client.query_order = temporary_failure
+        stop = NoSleepStop()
+        result = self.run_bot(stop=stop)
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(self.client.place_calls, 1)
+        self.assertEqual(len(queries), 2)
+        self.assertEqual(stop.waits, [2])
+        self.assertEqual(result["entries"], 1)
+        self.assertEqual(self.journal()["orders"][-1]["status"], "protected")
+
+    def test_exhausted_fill_query_retry_requires_inspection_and_keeps_one_submit(self):
+        queries = []
+        def unavailable(*_args):
+            queries.append(1)
+            raise OkxError("Temporary order service unavailable", category="server",
+                           api_code="50013", http_status=503)
+        self.client.query_order = unavailable
+        stop = NoSleepStop()
+        result = self.run_bot(3, stop=stop)
+        self.assertTrue(result["halted"])
+        self.assertEqual(result["phase"], "halted")
+        self.assertEqual(result["halt_category"], "server")
+        self.assertEqual(result["halt_api_code"], "50013")
+        self.assertEqual(result["halt_http_status"], 503)
+        self.assertEqual(self.client.place_calls, 1)
+        self.assertEqual(len(queries), 3)
+        self.assertEqual(stop.waits, [2, 4])
+        self.assertEqual(self.journal()["orders"][-1]["status"], "inspect_required")
+        self.assertIsNotNone(result["position"])
+
+    def test_stop_during_fill_query_backoff_keeps_unknown_order_for_inspection(self):
+        queries = []
+        def unavailable(*_args):
+            queries.append(1)
+            raise OkxError("Temporary order read timeout", category="timeout")
+        self.client.query_order = unavailable
+        stop = NoSleepStop(stop_on_wait=True)
+        result = self.run_bot(3, stop=stop)
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(self.client.place_calls, 1)
+        self.assertEqual(stop.waits, [2])
+        self.assertTrue(result["halted"])
+        self.assertEqual(self.journal()["orders"][-1]["status"], "inspect_required")
+        self.assertIsNotNone(result["position"])
+
+    def test_stop_during_read_backoff_prevents_next_call_and_mutation(self):
+        calls = []
+        def unavailable():
+            calls.append(1)
+            raise OkxError("Temporary read timeout", category="timeout")
+        self.client.balances = unavailable
+        stop = NoSleepStop(stop_on_wait=True)
+        result = self.run_bot(3, stop=stop)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(stop.waits, [2])
+        self.assertEqual(self.client.leverage_calls, 0)
+        self.assertEqual(self.client.place_calls, 0)
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(result["phase"], "stopped")
 
     def test_virtual_day_keeps_polling_without_reentering_historical_signals(self):
         # This checks a full day of logical polling, not real network uptime.
@@ -226,6 +404,90 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(self.client.place_calls, 0)
         self.assertEqual(self.journal()["orders"][-1]["status"], "closed")
         self.assertTrue(self.journal()["orders"][-1]["never_submitted"])
+
+    def test_signal_expiring_during_mark_read_is_skipped_without_submit(self):
+        clock = [NOW]
+        def delayed_mark(_inst_id):
+            clock[0] = NOW + 45_000
+            return D("101"), clock[0]
+        self.client.mark_price = delayed_mark
+        with patch("okx_bot.demo._now_ms", side_effect=lambda: clock[0]):
+            result = self.run_bot(3, stop=NoSleepStop())
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(self.client.place_calls, 0)
+        self.assertEqual(result["skipped_signals"], 1)
+
+    def test_signal_expiring_after_intent_closes_unsent_intent(self):
+        clock = [NOW]
+        original = demo._save
+        def expire_after_intent(path, contents):
+            original(path, contents)
+            if path.name == "demo-journal.json" and contents["orders"][-1]["status"] == "intent":
+                clock[0] = NOW + 45_000
+        with patch("okx_bot.demo._now_ms", side_effect=lambda: clock[0]), \
+             patch("okx_bot.demo._save", side_effect=expire_after_intent):
+            result = self.run_bot(3, stop=NoSleepStop())
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(self.client.place_calls, 0)
+        self.assertEqual(result["skipped_signals"], 1)
+        self.assertEqual(self.journal()["orders"][-1]["status"], "closed")
+        self.assertTrue(self.journal()["orders"][-1]["never_submitted"])
+
+    def test_mark_expiring_during_intent_write_closes_unsent_intent(self):
+        clock = [NOW]
+        self.client.mark = (D("101"), NOW - 10_000)
+        original = demo._save
+        def slow_intent_write(path, contents):
+            original(path, contents)
+            if path.name == "demo-journal.json" and contents["orders"][-1]["status"] == "intent":
+                clock[0] += 25_000
+        # Signal and account/flat snapshots are 25s old, but the previously
+        # fetched mark is now 35s old and must independently prohibit submit.
+        with patch("okx_bot.demo._now_ms", side_effect=lambda: clock[0]), \
+             patch("okx_bot.demo._save", side_effect=slow_intent_write):
+            result = self.run_bot(3, stop=NoSleepStop())
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(self.client.place_calls, 0)
+        self.assertEqual(result["skipped_signals"], 1)
+        self.assertEqual(self.journal()["orders"][-1]["status"], "closed")
+        self.assertTrue(self.journal()["orders"][-1]["never_submitted"])
+
+    def test_old_account_snapshot_is_not_used_even_with_fresh_mark_and_signal(self):
+        clock = [NOW]
+        def delayed_mark(_inst_id):
+            clock[0] = NOW + 31_000
+            return D("101"), clock[0]
+        self.client.mark_price = delayed_mark
+        # The signal's 2*poll freshness budget is 120s here, independently of
+        # the fixed 30s account/flat-check freshness budget.
+        with patch("okx_bot.demo._now_ms", side_effect=lambda: clock[0]):
+            result = demo.run_demo(config(), self.state, NoSleepStop(),
+                                   poll_seconds=60, client=self.client, max_cycles=1)
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(result["skipped_signals"], 1)
+        self.assertEqual(self.client.place_calls, 0)
+
+    def test_slow_balance_read_does_not_reset_account_snapshot_age(self):
+        clock = [NOW]
+        original = self.client.balances
+        calls = []
+        def delayed_balance():
+            calls.append(1)
+            # Startup succeeds immediately. Only the main cycle's balance
+            # request consumes 31s, independently of all later market reads.
+            if len(calls) == 2:
+                clock[0] += 31_000
+            return original()
+        self.client.balances = delayed_balance
+        self.client.mark_price = lambda _inst_id: (D("101"), clock[0])
+        with patch("okx_bot.demo._now_ms", side_effect=lambda: clock[0]):
+            result = demo.run_demo(config(), self.state, NoSleepStop(),
+                                   poll_seconds=60, client=self.client, max_cycles=1)
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(result["phase"], "stopped")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["skipped_signals"], 1)
+        self.assertEqual(self.client.place_calls, 0)
 
     def test_existing_algo_and_pending_orders_block_mutation(self):
         for kind in ("algo_rows", "order_rows"):
@@ -332,12 +594,20 @@ class DemoTests(unittest.TestCase):
 
     def test_late_new_signal_does_not_execute(self):
         # The broad bar-history freshness check passes; execution's tighter
-        # signal freshness check must independently refuse this late signal.
-        times = iter([NOW, NOW] + [NOW + 45_000] * 10)
-        with patch("okx_bot.demo._now_ms", side_effect=lambda: next(times)):
-            result = self.run_bot()
-        self.assertTrue(result["halted"])
-        self.assertIn("signal arrived too late", result["halt_reason"])
+        # signal freshness check skips once, without halting or chasing it later.
+        clock = [NOW]
+        original = self.client.candles
+        def delayed_candles(*args):
+            candles = original(*args)
+            if self.client.candle_calls > 1:
+                clock[0] = NOW + 45_000
+            return candles
+        self.client.candles = delayed_candles
+        with patch("okx_bot.demo._now_ms", side_effect=lambda: clock[0]):
+            result = self.run_bot(3, stop=NoSleepStop())
+        self.assertFalse(result["halted"], result)
+        self.assertEqual(result["skipped_signals"], 1)
+        self.assertEqual(self.client.candle_calls, 4)
         self.assertEqual(self.client.place_calls, 0)
 
     def test_status_file_reports_actual_result(self):

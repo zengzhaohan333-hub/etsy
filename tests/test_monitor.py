@@ -130,6 +130,48 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(result["profile"]["fast_window"], 5)
         self.assertNotIn("test-secret", json.dumps(result))
 
+    def test_retry_heartbeat_does_not_look_like_a_fresh_account_sample(self):
+        self.state.update(phase="running", connection={"state": "retrying", "attempt": 2, "max_attempts": 3,
+                          "secret": "test-secret"}, last_success_at_ms=self.now - 100_000)
+        self.write()
+        result = self.monitor.snapshot(self.now)
+        self.assertEqual(result["health"], "retrying")
+        self.assertFalse(result["stale"])
+        self.assertEqual(result["equity_curve"], [])
+        self.assertNotIn("test-secret", json.dumps(result))
+        self.state["connection"]["state"] = "checking"
+        self.write()
+        self.assertEqual(self.monitor.snapshot(self.now)["health"], "checking")
+        self.state["connection"]["state"] = "connected"
+        self.state["last_success_at_ms"] = self.now
+        self.write()
+        result = self.monitor.snapshot(self.now)
+        self.assertEqual(result["health"], "updating")
+        self.assertEqual(len(result["equity_curve"]), 1)
+
+    def test_controlled_halt_messages_help_legacy_and_new_robots_without_raw_errors(self):
+        self.state.update(halted=True, halt_reason="OKX HTTPS request failed; check network, time and demo credentials")
+        self.write()
+        self.assertIn("HTTPS", self.monitor.snapshot(self.now)["halt_message"])
+        self.state.update(halt_api_code="50110", halt_reason="test-secret")
+        self.write()
+        self.assertIn("白名单", self.monitor.snapshot(self.now)["halt_message"])
+        self.state.update(halt_api_code="50110 test-key", halt_category="timeout")
+        self.write()
+        result = self.monitor.snapshot(self.now)
+        self.assertIn("超时", result["halt_message"])
+        self.assertNotIn("test-secret", json.dumps(result))
+        self.assertNotIn("test-key", json.dumps(result))
+
+    def test_user_stopped_state_is_distinct_from_halt_and_stale_health(self):
+        self.state.update(phase="stopped", connection={"state": "connected", "attempt": 0, "max_attempts": 3})
+        self.write()
+        result = self.monitor.snapshot(self.now + 100_000)
+        self.assertEqual(result["health"], "stopped")
+        self.assertTrue(result["stale"])
+        self.assertFalse(result["halted"])
+        self.assertEqual(result["equity_curve"], [])
+
     def test_local_page_nonce_and_read_only_routes(self):
         code, body, handler = self.request(path="/")
         self.assertEqual(code, 200)

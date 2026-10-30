@@ -24,6 +24,7 @@ from typing import Any, Callable
 from .config import Config, load_config
 from .demo import run_demo
 from .okx import Credentials, OkxClient, OkxError
+from .read_retry import ReadRetryClient
 
 
 class ConnectionCheckError(RuntimeError):
@@ -80,6 +81,10 @@ def check_demo(config: Config, client: Any, *,
                progress: Callable[[str], None] | None = None) -> dict[str, Any]:
     """Read-only checks. Never change account settings, orders or leverage."""
     report = progress or (lambda _message: None)
+    client = ReadRetryClient(client, threading.Event(),
+        on_retry=lambda event: report(f"只读查询暂未成功，正在重试 {event['attempt']}/{event['max_attempts']}……"),
+        on_recovered=lambda: report("只读查询已恢复，继续核对账户与挂单……"))
+    client.begin_cycle(60)
     report("正在检查欧易公共接口与系统时间（此请求不发送凭证）……")
     server_ms = client.server_time()
     if type(server_ms) is not int or abs(server_ms - time.time_ns() // 1_000_000) > 5_000:

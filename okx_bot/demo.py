@@ -20,6 +20,7 @@ from typing import Any
 
 from .core import CrossStrategy, position_size, protection_prices
 from .okx import Credentials, OkxClient, OkxError
+from .read_retry import ReadRetryClient, is_retryable_read_error
 
 
 class DemoHalt(RuntimeError):
@@ -188,6 +189,8 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
     """
     report: dict[str, Any] = {"mode": "demo", "halted": False, "halt_reason": "",
                               "entries": 0, "position": None,
+                              "phase": "starting", "skipped_signals": 0,
+                              "connection": {"state": "checking", "attempt": 0, "max_attempts": 3},
                               "note": "Stopping does not close exchange positions. Inspect actual positions and TP/SL after any error."}
     journal: dict[str, Any] | None = None
     journal_path: Path | None = None
@@ -199,6 +202,27 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
         report["updated_at_ms"] = _now_ms()
         if status_path is not None and status_writable:
             _save(status_path, report)
+
+    def retrying(event: dict[str, Any]) -> None:
+        report["connection"] = event
+        publish_status()
+
+    def recovered() -> None:
+        report["connection"] = {"state": "checking", "attempt": 0, "max_attempts": 3}
+        publish_status()
+
+    def cycle_complete() -> None:
+        report["phase"] = "running"
+        report["last_success_at_ms"] = _now_ms()
+        report["connection"] = {"state": "connected", "attempt": 0, "max_attempts": 3}
+
+    def skipped_signal() -> None:
+        report["skipped_signals"] += 1
+        report["last_event"] = "stale_signal_skipped"
+        cycle_complete()
+        publish_status()
+        if max_cycles is None or cycles < max_cycles:
+            stop.wait(poll_seconds)
 
     try:
         if not 0 < poll_seconds <= 60:
@@ -220,6 +244,12 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
             locks.enter_context(_lock(state_dir / "demo.lock"))
             status_writable = True
             journal = _load(journal_path)
+            if stop.is_set():
+                report["phase"] = "stopped"
+                publish_status()
+                return report
+            client = ReadRetryClient(client, stop, on_retry=retrying, on_recovered=recovered)
+            client.begin_cycle(60)
             account = client.account_config()
             if account.get("posMode") != "net_mode" or str(account.get("acctLv")) != "2":
                 raise DemoHalt("Demo account must use net mode and single-currency margin (acctLv=2)")
@@ -246,6 +276,7 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
                 raise DemoHalt("Demo account has no positive available USDT equity")
             peak_equity = starting_equity
             if stop.is_set():
+                report["phase"] = "stopped"
                 publish_status()
                 return report
             client.set_leverage(config.instrument, "1")
@@ -257,6 +288,8 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
             cycles = 0
             while not stop.is_set() and (max_cycles is None or cycles < max_cycles):
                 cycles += 1
+                client.begin_cycle(60)
+                balance_checked_at = _now_ms()
                 balances = client.balances()
                 equity = _number(balances.get("equity"), "equity")
                 available = _number(balances.get("available"), "available")
@@ -264,6 +297,7 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
                     raise DemoHalt("Invalid demo balance")
                 peak_equity = max(peak_equity, equity)
                 report["equity"] = str(equity)
+                flat_checked_at = _now_ms()
                 rows = _positions(client, config.instrument)
                 report["position"] = _position_summary(rows)
                 if entry is not None:
@@ -299,13 +333,21 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
                         if signal not in {"long", "short"}:
                             raise DemoHalt("Unsupported strategy signal")
                         if _now_ms() - (last.ts + interval) > max(30_000, int(poll_seconds * 2_000)):
-                            raise DemoHalt("New strategy signal arrived too late to execute")
+                            skipped_signal()
+                            continue
                         mark_price, mark_timestamp = client.mark_price(config.instrument)
                         if stop.is_set():
                             break  # stop may arrive during a blocking HTTPS read
                         mark_age = _now_ms() - mark_timestamp
                         if mark_age < -5_000 or mark_age > 30_000 or mark_price <= 0:
                             raise DemoHalt("Mark price is stale or invalid; no order submitted")
+                        checked_now = _now_ms()
+                        if (checked_now - (last.ts + interval) > max(30_000, int(poll_seconds * 2_000))
+                                or not -5_000 <= checked_now - mark_timestamp <= 30_000
+                                or not -5_000 <= checked_now - balance_checked_at <= 30_000
+                                or not -5_000 <= checked_now - flat_checked_at <= 30_000):
+                            skipped_signal()
+                            continue
                         budget = min(config.initial_equity, equity, available)
                         quantity = position_size(config, budget, mark_price, metadata.ct_val,
                                                  metadata.lot_size, metadata.min_size, metadata.max_market_size)
@@ -322,29 +364,60 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
                                 _save(journal_path, journal)
                                 entry = None
                                 break
+                            checked_now = _now_ms()
+                            if (checked_now - (last.ts + interval) > max(30_000, int(poll_seconds * 2_000))
+                                    or not -5_000 <= checked_now - mark_timestamp <= 30_000
+                                    or not -5_000 <= checked_now - balance_checked_at <= 30_000
+                                    or not -5_000 <= checked_now - flat_checked_at <= 30_000):
+                                entry["status"] = "closed"
+                                entry["never_submitted"] = True
+                                entry["closed_at_ms"] = checked_now
+                                _save(journal_path, journal)
+                                entry = None
+                                skipped_signal()
+                                continue
                             acknowledgement = client.place_market_order(config.instrument,
                                 "buy" if signal == "long" else "sell", quantity, entry["client_id"],
                                 stop_loss=sl, take_profit=tp)
                             entry["status"] = "accepted"
                             entry["order_id"] = str(acknowledgement["ordId"])
                             _save(journal_path, journal)
+                            client.begin_cycle(60)
                             _verify_fill(client, config, entry, stop, poll_seconds)
                             entry["status"] = "protected"
                             _save(journal_path, journal)
                             report["entries"] += 1
                             report["position"] = _position_summary(_positions(client, config.instrument))
+                cycle_complete()
                 publish_status()
                 if max_cycles is None or cycles < max_cycles:
                     stop.wait(poll_seconds)
             if entry is not None:
                 report["note"] = "Demo runner stopped with an open position; exchange TP/SL remains active. Restart is blocked until manual reconciliation."
+            report["phase"] = "stopped"
             publish_status()
     except (DemoHalt, OkxError, OSError, ValueError, KeyError, TypeError, ArithmeticError):
         # Never include raw unexpected exception/HTTP data: transports may contain
         # credentials. Known local errors already carry sanitized messages.
         import sys
         error = sys.exc_info()[1]
+        if (stop.is_set() and entry is None and isinstance(error, OkxError)
+                and is_retryable_read_error(error)):
+            report["phase"] = "stopped"
+            report["connection"] = {"state": "failed", "attempt": 0, "max_attempts": 3}
+            report["note"] = "Stopped during a read retry; no new order was submitted. Inspect exchange state before restarting."
+            try:
+                publish_status()
+            except OSError:
+                pass
+            return report
         report["halted"] = True
+        report["phase"] = "halted"
+        if isinstance(error, OkxError):
+            report["halt_category"] = error.category
+            report["halt_api_code"] = error.api_code
+            report["halt_http_status"] = error.http_status
+        report["connection"] = {"state": "failed", "attempt": 0, "max_attempts": 3}
         report["halt_reason"] = str(error) if isinstance(error, (DemoHalt, OkxError)) else "Demo controller error; inspect journal and exchange state before restarting"
         if entry is not None and journal is not None and journal_path is not None:
             entry["status"] = "inspect_required"

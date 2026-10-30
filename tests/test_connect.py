@@ -339,10 +339,23 @@ class ConnectTests(unittest.TestCase):
         error.category = 'timeout'
         self.client.server_time = Mock(side_effect=error)
         self.client.account_config = Mock()
-        self.assertEqual(self.invoke(), 1)
+        with patch("okx_bot.connect.threading.Event.wait", return_value=False) as wait:
+            self.assertEqual(self.invoke(), 1)
+        self.assertEqual(self.client.server_time.call_count, 3)
+        self.assertEqual([call.args for call in wait.call_args_list], [(2,), (4,)])
         self.assertIn('连接超时', self.stderr.getvalue())
         self.client.account_config.assert_not_called()
         self.answer.assert_not_called()
+        self.runner.assert_not_called()
+        self.assert_no_secrets_printed()
+
+    def test_readonly_wizard_recovers_a_transient_query_without_printing_keys(self):
+        self.client.server_time = Mock(side_effect=[OkxError(ENV['OKX_API_SECRET'], category='timeout'), self.client.server_ms])
+        with patch("okx_bot.connect.threading.Event.wait", return_value=False):
+            self.assertEqual(self.invoke('--check-only'), 0)
+        self.assertEqual(self.client.server_time.call_count, 2)
+        self.assertIn('重试 2/3', self.stdout.getvalue())
+        self.assertIn('只读检查通过', self.stdout.getvalue())
         self.runner.assert_not_called()
         self.assert_no_secrets_printed()
 

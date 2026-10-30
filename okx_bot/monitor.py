@@ -40,6 +40,46 @@ def _timestamp(value):
     return value if type(value) is int and 0 <= value <= 32_503_680_000_000 else None
 
 
+def _connection(value):
+    if not isinstance(value, dict) or value.get("state") not in {"checking", "connected", "retrying", "failed", "blocked"}:
+        return None
+    result = {"state": value["state"]}
+    for field in ("attempt", "max_attempts"):
+        if type(value.get(field)) is int and 0 <= value[field] <= 3:
+            result[field] = value[field]
+    return result
+
+
+def _halt_message(state):
+    if not state.get("halted"):
+        return None
+    code = state.get("halt_api_code")
+    if isinstance(code, str) and re.fullmatch(r"[0-9]{1,12}", code):
+        meanings = {"50110": "请求来源 IP 未通过 API 白名单校验。", "50101": "API 与模拟盘环境不匹配。",
+                    "50102": "请求时间校验失败，请同步电脑时间。", "50105": "API Passphrase 校验失败。",
+                    "50111": "API Key 校验失败。", "50113": "请求签名校验失败。",
+                    "50011": "读取请求持续受到限流。", "50004": "读取请求持续超时。",
+                    "50013": "欧易服务暂时不可用，读取重试仍未成功。"}
+        return meanings.get(code, f"欧易返回 API 错误代码 {code}。")
+    category = state.get("halt_category")
+    meanings = {"timeout": "读取欧易数据持续超时，请检查代理和网络。",
+                "dns": "域名解析失败，请检查代理和网络。",
+                "transport": "读取欧易数据时连接失败，请检查代理和网络。",
+                "tls": "HTTPS 证书校验或握手失败；请检查时间、证书和网络，保留证书校验。",
+                "server": "欧易服务暂时不可用，有限读取重试后仍未恢复。",
+                "rate_limit": "读取请求持续受到限流。",
+                "invalid_response": "收到无效数据，机器人已停止，不能将其当作空仓。",
+                "credential_format": "API 凭证格式无法用于请求，请在本机核对。"}
+    if type(category) is str and category in meanings:
+        return meanings[category]
+    reason = state.get("halt_reason")
+    known = {"OKX HTTPS request failed; check network, time and demo credentials": "旧版记录了 HTTPS 查询失败，具体网络类型未记录；这不表示已经确认密钥失效。",
+             "Read verification time budget exceeded; inspect exchange state": "账户或订单读取核对超过时间预算，请检查网络并核对欧易状态。",
+             "Session drawdown limit reached; new entries stopped; any reported position remains open": "会话权益触及回撤阈值，已停止新增交易；已有仓位不会自动平仓。",
+             "Missed candle interval; restart safely instead of trading old signals": "行情 K 线出现跨周期缺口，机器人停止并保留核对要求。"}
+    return known.get(reason, "机器人记录异常停止，请查看启动窗口并到欧易核对订单与保护单。") if type(reason) is str else "机器人记录异常停止，请到欧易核对订单与保护单。"
+
+
 def _read(path):
     with path.open("rb") as stream:
         raw = stream.read(MAX_BYTES + 1)
@@ -123,6 +163,9 @@ class DemoMonitor:
             updated = state["updated_at_ms"]
             age = now - updated
             stale = age > MAX_AGE_MS or age < -5_000
+            connection = _connection(state.get("connection"))
+            phase = state.get("phase") if state.get("phase") in {"starting", "running", "stopped", "halted"} else None
+            last_success = _timestamp(state.get("last_success_at_ms"))
             position = state.get("position")
             clean_position = None
             if isinstance(position, dict):
@@ -133,21 +176,29 @@ class DemoMonitor:
             elif position is not None:
                 raise ValueError()
             equity = _number(state.get("equity"))
+            sample_time = last_success if last_success is not None else updated
+            sample_age = now - sample_time
+            sample_valid = (not state["halted"] and not stale and -5_000 <= sample_age <= MAX_AGE_MS
+                            and phase != "stopped" and (connection is None or connection["state"] == "connected"))
             with self.lock:
-                if equity is not None and not stale:
-                    if not self.curve or updated > self.curve[-1]["ts"]:
-                        self.curve.append({"ts": updated, "equity": equity})
-                    elif updated < self.curve[-1]["ts"]:
+                if equity is not None and sample_valid:
+                    if not self.curve or sample_time > self.curve[-1]["ts"]:
+                        self.curve.append({"ts": sample_time, "equity": equity})
+                    elif sample_time < self.curve[-1]["ts"]:
                         self.curve.clear()
-                        self.curve.append({"ts": updated, "equity": equity})
+                        self.curve.append({"ts": sample_time, "equity": equity})
                 curve = list(self.curve)
             orders, warning = self._journal()
             return {"ok": True, "mode": "demo", "halted": state["halted"],
                     "stale": stale, "updated_at_ms": updated, "age_ms": max(0, age),
                     "equity": equity, "entries": state["entries"], "position": clean_position,
+                    "phase": phase, "connection": connection, "last_success_at_ms": last_success,
+                    "halt_message": _halt_message(state),
                     "profile": self._profile(), "orders": orders, "warning": warning,
                     "equity_curve": curve,
-                    "health": "halted" if state["halted"] else "stale" if stale else "updating"}
+                    "health": ("halted" if state["halted"] else "stopped" if phase == "stopped"
+                               else "stale" if stale else connection["state"] if connection is not None
+                               and connection["state"] in {"retrying", "checking"} else "updating")}
         except (OSError, ValueError, TypeError, RecursionError):
             return {"ok": False, "health": "unavailable", "error": "无法读取有效的欧易模拟盘状态。请确认选择了正在运行机器人目录中的 .runtime-demo/status.json。"}
 
