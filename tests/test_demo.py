@@ -10,6 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from okx_bot import demo
+from okx_bot.config import Config
+from okx_bot.core import CrossStrategy
 from okx_bot.okx import AmbiguousOrderError, Candle, Credentials, Instrument
 
 
@@ -145,6 +147,43 @@ class DemoTests(unittest.TestCase):
         self.assertFalse(result["halted"])
         self.assertEqual(self.client.place_calls, 0)
         self.assertEqual(result["entries"], 0)
+
+    def test_virtual_day_keeps_polling_without_reentering_historical_signals(self):
+        # This checks a full day of logical polling, not real network uptime.
+        interval = 900_000
+        initial = 20_000 * 86_400_000
+        clock = [initial]
+        timestamps = []
+
+        class VirtualStop:
+            def is_set(self):
+                return False
+
+            def wait(self, seconds):
+                clock[0] += int(seconds * 1000)
+                return False
+
+        def latest_candles(_instrument, _bar, _limit):
+            end = clock[0] // interval * interval
+            return [candle(end - (22 - i) * interval) for i in range(22)]
+
+        def remember_status(_path, state):
+            timestamps.append(state["updated_at_ms"])
+
+        self.client.candles = latest_candles
+        self.client.server_time = lambda: clock[0]
+        with patch("okx_bot.demo._now_ms", side_effect=lambda: clock[0]), \
+             patch("okx_bot.demo.CrossStrategy", CrossStrategy), \
+             patch("okx_bot.demo._save", side_effect=remember_status):
+            result = demo.run_demo(Config(), self.state, VirtualStop(), poll_seconds=15,
+                                   client=self.client, max_cycles=5761)
+        self.assertFalse(result["halted"], result["halt_reason"])
+        self.assertEqual(clock[0] - initial, 86_400_000)
+        self.assertEqual(timestamps[0], initial)
+        self.assertEqual(timestamps[-1], initial + 86_400_000)
+        self.assertGreaterEqual(len(timestamps), 5761)
+        self.assertEqual(self.client.place_calls, 0)
+        self.assertEqual(self.client.leverage_calls, 1)
 
     def test_normal_entry_is_journaled_then_full_fill_and_bracket_verified(self):
         result = self.run_bot(3)
