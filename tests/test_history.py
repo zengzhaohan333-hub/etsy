@@ -1,7 +1,11 @@
 import copy
+import errno
 import hashlib
+import http.client
 import io
 import json
+import socket
+import ssl
 import tempfile
 import unittest
 import urllib.error
@@ -307,6 +311,12 @@ class PublicTransportTests(unittest.TestCase):
     def get(self, client):
         return client.get(history.ENDPOINTS["funding"], {"instId": "BTC-USDT-SWAP", "limit": "100", "after": str(NOW)})
 
+    def assert_safe_error(self, error, notices=()):
+        displayed = str(error) + repr(vars(error)) + " ".join(notices)
+        for secret in ("diagnostic-secret", "proxy-user", "proxy-password", "other.example"):
+            self.assertNotIn(secret, displayed)
+        self.assertIsNone(error.__cause__)
+
     def test_production_get_no_auth_no_simulated_header_and_bounded_timeout(self):
         calls = []
         def opener(request, timeout):
@@ -387,6 +397,8 @@ class PublicTransportTests(unittest.TestCase):
                 self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None))
             self.assertEqual(len(calls), 1)
             self.assertNotIn("diagnostic-secret", str(raised.exception))
+            self.assertEqual(raised.exception.category, "http")
+            self.assertEqual(raised.exception.http_status, status)
         self.assertIsNone(history._NoRedirect().redirect_request(None, None, 302, "", {}, "https://other.example"))
 
     def test_transport_and_invalid_or_oversized_json_fail_without_sensitive_text(self):
@@ -409,6 +421,197 @@ class PublicTransportTests(unittest.TestCase):
                 self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None))
             self.assertEqual(len(calls), 1)
             self.assertNotIn("diagnostic-secret", str(raised.exception))
+            expected = "connection" if kind == "transport" else "api" if kind == "api" else "invalid_response"
+            self.assertEqual(raised.exception.category, expected)
+
+    def test_typed_transient_transport_recovers_or_stops_at_three_attempts(self):
+        cases = [
+            (lambda: TimeoutError("diagnostic-secret"), "timeout", None),
+            (lambda: ConnectionResetError(errno.ECONNRESET, "diagnostic-secret"), "connection", None),
+            (lambda: ConnectionAbortedError(errno.ECONNABORTED, "diagnostic-secret"), "connection", None),
+            (lambda: BrokenPipeError(errno.EPIPE, "diagnostic-secret"), "connection", None),
+            (lambda: ConnectionRefusedError(errno.ECONNREFUSED, "diagnostic-secret"), "connection", None),
+            (lambda: http.client.RemoteDisconnected("diagnostic-secret"), "connection", None),
+            (lambda: http.client.IncompleteRead(b"diagnostic-secret", 100), "connection", None),
+            (lambda: ssl.SSLEOFError(8, "diagnostic-secret"), "connection", "unexpected_eof"),
+            (lambda: socket.gaierror(socket.EAI_AGAIN, "diagnostic-secret"), "dns", None),
+        ]
+        for factory, category, tls_failure in cases:
+            for wrapped in (False, True):
+                for recover in (False, True):
+                    with self.subTest(kind=category, tls=tls_failure, wrapped=wrapped, recover=recover):
+                        calls, notices = [], []
+                        def opener(request, timeout):
+                            calls.append(request)
+                            if recover and len(calls) == 2:
+                                return Response(b'{"code":"0","data":[]}')
+                            error = factory()
+                            raise urllib.error.URLError(error) if wrapped else error
+                        client = history.PublicHistoryClient(opener=opener, sleep=lambda _: None, progress=notices.append)
+                        if recover:
+                            self.assertEqual(self.get(client), [])
+                            self.assertEqual(len(calls), 2)
+                            self.assertEqual(len(notices), 1)
+                        else:
+                            with self.assertRaises(history.HistoryError) as raised:
+                                self.get(client)
+                            self.assertEqual(len(calls), 3)
+                            self.assertEqual(len(notices), 2)
+                            self.assertEqual(raised.exception.category, category)
+                            self.assertEqual(raised.exception.tls_failure, tls_failure)
+                            self.assert_safe_error(raised.exception, notices)
+                        self.assertTrue(all(request.get_method() == "GET" for request in calls))
+                        self.assertNotIn("diagnostic-secret", " ".join(notices))
+
+    def test_certificate_unknown_tls_dns_and_untyped_reasons_are_never_retried(self):
+        cases = [
+            (lambda: ssl.SSLCertVerificationError(1, "diagnostic-secret"), "tls", "certificate"),
+            (lambda: urllib.error.URLError(ssl.SSLCertVerificationError(1, "diagnostic-secret")), "tls", "certificate"),
+            (lambda: ssl.SSLError(1, "diagnostic-secret"), "tls", "handshake"),
+            (lambda: socket.gaierror(socket.EAI_NONAME, "diagnostic-secret"), "dns", None),
+            (lambda: socket.gaierror(socket.EAI_FAIL, "diagnostic-secret"), "dns", None),
+            (lambda: OSError("diagnostic-secret"), "connection", None),
+            (lambda: OSError(["diagnostic-secret"], "diagnostic-secret"), "connection", None),
+            (lambda: urllib.error.URLError("timed out diagnostic-secret proxy-user:proxy-password@other.example"), "connection", None),
+            (lambda: urllib.error.URLError("SSL EOF diagnostic-secret"), "connection", None),
+            (lambda: urllib.error.URLError(urllib.error.URLError(TimeoutError("diagnostic-secret"))), "connection", None),
+            (lambda: http.client.BadStatusLine("diagnostic-secret"), "invalid_response", None),
+            (lambda: ValueError("diagnostic-secret"), "invalid_response", None),
+        ]
+        for factory, category, tls_failure in cases:
+            with self.subTest(category=category, tls=tls_failure):
+                calls, notices = [], []
+                def opener(request, timeout):
+                    calls.append(request)
+                    raise factory()
+                with self.assertRaises(history.HistoryError) as raised:
+                    self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None, progress=notices.append))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(notices, [])
+                self.assertEqual(raised.exception.category, category)
+                self.assertEqual(raised.exception.tls_failure, tls_failure)
+                self.assert_safe_error(raised.exception)
+
+    def test_error_body_tls_classification_cannot_be_hidden_by_server_status(self):
+        cases = [(503, lambda: ssl.SSLCertVerificationError(1, "diagnostic-secret"), 1, "tls", "certificate"),
+                 (503, lambda: ssl.SSLError(1, "diagnostic-secret"), 1, "tls", "handshake"),
+                 (503, lambda: ssl.SSLEOFError(8, "diagnostic-secret"), 3, "connection", "unexpected_eof"),
+                 (401, lambda: ssl.SSLEOFError(8, "diagnostic-secret"), 1, "http", None),
+                 (403, lambda: TimeoutError("diagnostic-secret"), 1, "http", None)]
+        for status, factory, count, category, tls_failure in cases:
+            with self.subTest(status=status, category=category, tls=tls_failure):
+                calls, notices = [], []
+                class BrokenBody(io.BytesIO):
+                    def read(self, _limit):
+                        raise factory()
+                def opener(request, timeout):
+                    calls.append(request)
+                    raise urllib.error.HTTPError(request.full_url, status, "diagnostic-secret", {}, BrokenBody())
+                with self.assertRaises(history.HistoryError) as raised:
+                    self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None, progress=notices.append))
+                self.assertEqual(len(calls), count)
+                self.assertEqual(raised.exception.category, category)
+                self.assertEqual(raised.exception.tls_failure, tls_failure)
+                self.assertEqual(raised.exception.http_status, status)
+                self.assert_safe_error(raised.exception, notices)
+
+    def test_response_read_disconnect_discards_partial_body_before_retry(self):
+        calls = []
+        class BrokenResponse(Response):
+            def read(self, _limit):
+                raise http.client.IncompleteRead(b'{"code":"0","data":["diagnostic-secret"', 100)
+        def opener(request, timeout):
+            calls.append(request)
+            return BrokenResponse() if len(calls) == 1 else Response(b'{"code":"0","data":[]}')
+        self.assertEqual(self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None)), [])
+        self.assertEqual(len(calls), 2)
+
+    def test_custom_response_auth_status_is_terminal_even_when_body_disconnects(self):
+        calls = []
+        class BrokenAuthResponse(Response):
+            status = 401
+            def read(self, _limit):
+                raise ssl.SSLEOFError(8, "diagnostic-secret")
+        def opener(request, timeout):
+            calls.append(request)
+            return BrokenAuthResponse()
+        with self.assertRaises(history.HistoryError) as raised:
+            self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(raised.exception.category, "http")
+        self.assertEqual(raised.exception.http_status, 401)
+        self.assert_safe_error(raised.exception)
+
+    def test_http_auth_business_code_prevents_retry_even_on_http_503(self):
+        for code, count in (("50101", 1), ("50001", 3), ("0", 3)):
+            with self.subTest(code=code):
+                calls = []
+                def opener(request, timeout):
+                    calls.append(request)
+                    payload = json.dumps({"code": code, "msg": "diagnostic-secret", "data": []}).encode()
+                    raise urllib.error.HTTPError(request.full_url, 503, "diagnostic-secret", {}, io.BytesIO(payload))
+                with self.assertRaises(history.HistoryError) as raised:
+                    self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None))
+                self.assertEqual(len(calls), count)
+                self.assertEqual(raised.exception.category, "http")
+                self.assertEqual(raised.exception.http_status, 503)
+                self.assertEqual(raised.exception.api_code, None if code == "0" else code)
+                self.assert_safe_error(raised.exception)
+
+    def test_http_200_invalid_json_code_data_and_status_are_terminal(self):
+        payloads = [b'{"code":"0","data":[],"data":[],"msg":"diagnostic-secret"}',
+                    b'{"code":true,"data":[],"msg":"diagnostic-secret"}',
+                    b'{"code":null,"data":[]}', b'{"code":"0","data":{}}']
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                calls = []
+                def opener(request, timeout):
+                    calls.append(request)
+                    return Response(payload)
+                with self.assertRaises(history.HistoryError) as raised:
+                    self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(raised.exception.category, "invalid_response")
+                self.assertEqual(raised.exception.http_status, 200)
+                self.assert_safe_error(raised.exception)
+        for status in (True, "503", 99, 600):
+            with self.subTest(status=status):
+                calls = []
+                def opener(request, timeout):
+                    calls.append(request)
+                    response = Response(b'{"code":"0","data":[]}')
+                    response.status = status
+                    return response
+                with self.assertRaises(history.HistoryError) as raised:
+                    self.get(history.PublicHistoryClient(opener=opener, sleep=lambda _: None))
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(raised.exception.category, "invalid_response")
+
+    def test_diagnostics_validate_scalar_types_and_tls_category_pair(self):
+        error = history.HistoryError("safe", category=["diagnostic-secret"], api_code="50001 diagnostic-secret",
+                                     http_status=True, tls_failure=["diagnostic-secret"])
+        self.assertEqual(vars(error), {"category": "local", "http_status": None, "api_code": None, "tls_failure": None})
+        error = history.HistoryError("safe", category="http", http_status=503, api_code=50001,
+                                     tls_failure="certificate")
+        self.assertEqual(error.http_status, 503)
+        self.assertEqual(error.api_code, "50001")
+        self.assertIsNone(error.tls_failure)
+
+    def test_configured_attempt_limit_cannot_exceed_three_or_retry_forever(self):
+        for limit in (1, 2, 3):
+            with self.subTest(limit=limit):
+                calls = []
+                def opener(request, timeout):
+                    calls.append(request)
+                    raise TimeoutError("diagnostic-secret")
+                with self.assertRaises(history.HistoryError) as raised:
+                    self.get(history.PublicHistoryClient(opener=opener, max_attempts=limit, sleep=lambda _: None))
+                self.assertEqual(len(calls), limit)
+                self.assertEqual(raised.exception.category, "timeout")
+        for kwargs in ({"max_attempts": 4}, {"max_attempts": True}, {"timeout": True},
+                       {"timeout": float("nan")}, {"timeout": 31}, {"timeout": "15"}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(history.HistoryError):
+                history.PublicHistoryClient(**kwargs)
 
 
 if __name__ == "__main__":

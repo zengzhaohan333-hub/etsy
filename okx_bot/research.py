@@ -185,7 +185,8 @@ def _collect(profile, args):
                 dataset = load_dataset(cached)
             else:
                 dataset = fetch_dataset(market, days=args.days, now_ms=anchor, warmup_bars=WARMUP_BARS,
-                                        progress=lambda message: print(message, flush=True))
+                                        progress=lambda message: print(message, flush=True),
+                                        checkpoint_dir=args.state_dir / "downloads")
                 save_dataset(dataset, cached)
             if (dataset.start_ms != anchor - args.days * DAY_MS or dataset.end_ms != anchor
                     or dataset.bar != "5m" or dataset.warmup_bars < WARMUP_BARS
@@ -214,6 +215,7 @@ def main(argv=None):
         print("四币共享资金研究：仅公开历史数据，不需要API密钥，不会下单或修改当前机器人。", flush=True)
         print(f"本次研究本金{args.capital}U，每日{args.daily_target}U只作比较阈值；"
               f"每币200/500U，四币合计{args.max_total_notional}U。", flush=True)
+        print("历史分页校验后逐页保存；重开此研究入口会复核断点并续传，无需重启交易机器人。", flush=True)
         with exclusive_lock(args.state_dir / "research.lock"):
             datasets, sources = _collect(profile, args)
             print("四币数据已对齐，正在比较固定策略、仓位和双倍成本场景……", flush=True)
@@ -227,9 +229,12 @@ def main(argv=None):
         return 0
     except (ResearchError, HistoryError) as error:
         print(f"研究未完成：{error}", file=sys.stderr)
+        if isinstance(error, HistoryError):
+            print("已通过校验的分页保留在研究目录；请保留该目录，按上方原因处理后重新打开研究入口续传。",
+                  file=sys.stderr)
         return 1
     except (KeyboardInterrupt, EOFError):
-        print("研究已取消；已完整保存的合约缓存可在下次继续使用。", file=sys.stderr)
+        print("研究已取消；已保存的分页和完整合约缓存可在下次继续使用。", file=sys.stderr)
         return 130
     except Exception:
         print("研究未完成，请检查历史连接、缓存和配置；原始错误未显示，不会替换为演示数据。", file=sys.stderr)

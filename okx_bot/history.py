@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import errno
 import json
+import math
 import os
 import re
+import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -30,6 +34,22 @@ from .okx import Candle, Instrument
 
 class HistoryError(RuntimeError):
     """Only locally generated messages and validated numeric codes are exposed."""
+
+    CATEGORIES = frozenset({"local", "timeout", "connection", "dns", "tls",
+                            "http", "api", "invalid_response"})
+
+    def __init__(self, message: str, *, category: str = "local",
+                 http_status: Any = None, api_code: Any = None,
+                 tls_failure: Any = None) -> None:
+        super().__init__(message)
+        self.category = category if type(category) is str and category in self.CATEGORIES else "local"
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        self.api_code = (str(api_code) if type(api_code) in (str, int)
+                         and re.fullmatch(r"[0-9]{1,12}", str(api_code)) else None)
+        valid_tls = (type(tls_failure) is str
+                     and ((self.category == "tls" and tls_failure in {"certificate", "handshake"})
+                          or (self.category == "connection" and tls_failure == "unexpected_eof")))
+        self.tls_failure = tls_failure if valid_tls else None
 
 
 BASE_URL = "https://www.okx.com"
@@ -132,6 +152,55 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _transport_details(error: BaseException) -> tuple[str, str | None, bool]:
+    """Classify one typed urllib reason without retaining or reading its text.
+
+    Unknown OSErrors/string reasons are not proof of a transient connection
+    failure. TLS verification and unknown SSL failures always fail closed.
+    """
+    cause = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(cause, ssl.SSLCertVerificationError):
+        return "tls", "certificate", False
+    if isinstance(cause, ssl.SSLEOFError):
+        return "connection", "unexpected_eof", True
+    if isinstance(cause, ssl.SSLError):
+        return "tls", "handshake", False
+    if isinstance(cause, (TimeoutError, socket.timeout)):
+        return "timeout", None, True
+    if isinstance(cause, socket.gaierror):
+        return "dns", None, cause.errno == socket.EAI_AGAIN
+    if isinstance(cause, (ConnectionResetError, ConnectionAbortedError,
+                          BrokenPipeError, ConnectionRefusedError,
+                          http.client.RemoteDisconnected, http.client.IncompleteRead)):
+        return "connection", None, True
+    if isinstance(cause, OSError):
+        error_number = cause.errno if type(cause.errno) is int else None
+        if error_number == errno.ETIMEDOUT:
+            return "timeout", None, True
+        if error_number in {errno.ECONNRESET, errno.ECONNABORTED, errno.ECONNREFUSED,
+                            errno.EPIPE, getattr(errno, "ENETRESET", -1)}:
+            return "connection", None, True
+    if isinstance(cause, (ValueError, http.client.HTTPException)):
+        return "invalid_response", None, False
+    return "connection", None, False
+
+
+def _transport_message(category: str, tls_failure: str | None, attempts: int) -> str:
+    messages = {
+        "timeout": "欧易公开历史请求连接超时",
+        "connection": "欧易公开历史连接中断或不可用",
+        "dns": "欧易公开历史域名解析未完成",
+        "invalid_response": "欧易公开历史连接未返回有效的 HTTP 数据",
+    }
+    if tls_failure == "certificate":
+        return "欧易公开历史 HTTPS 证书验证失败；请核对系统时间和证书链，保留证书校验。"
+    if tls_failure == "handshake":
+        return "欧易公开历史 TLS 握手失败；请检查网络和代理，保留证书校验。"
+    if tls_failure == "unexpected_eof":
+        return f"欧易公开历史 TLS 连接被提前关闭（已尝试 {attempts} 次）；请检查代理连接稳定性。"
+    return f"{messages.get(category, messages['connection'])}（已尝试 {attempts} 次）；没有使用不完整行情。"
+
+
 class PublicHistoryClient:
     """GET-only, fixed production host, no authentication or simulation headers."""
 
@@ -139,7 +208,8 @@ class PublicHistoryClient:
                  opener: Callable[..., Any] | None = None,
                  sleep: Callable[[float], Any] = time.sleep,
                  progress: Callable[[str], Any] | None = None) -> None:
-        if not 0 < timeout <= 30 or type(max_attempts) is not int or not 1 <= max_attempts <= 3:
+        if (type(timeout) not in (int, float) or not math.isfinite(timeout) or not 0 < timeout <= 30
+                or type(max_attempts) is not int or not 1 <= max_attempts <= 3):
             raise HistoryError("历史下载超时或重试次数设置无效。")
         self.timeout, self.max_attempts = timeout, max_attempts
         self._open = opener or urllib.request.build_opener(_NoRedirect()).open
@@ -169,6 +239,7 @@ class PublicHistoryClient:
                 self._sleep(max(0, 0.5 - (time.monotonic() - self._last_request)))
             self._last_request = time.monotonic()
             status, raw, http_failed = None, b"", False
+            transport = None
             try:
                 with self._open(request, timeout=self.timeout) as response:
                     status = getattr(response, "status", None)
@@ -178,30 +249,60 @@ class PublicHistoryClient:
                 status = error.code if type(error.code) is int and 100 <= error.code <= 599 else None
                 try:
                     raw = error.read(MAX_RESPONSE_BYTES + 1)
-                except (OSError, ValueError, http.client.HTTPException):
+                except (OSError, ValueError, http.client.HTTPException) as read_error:
+                    transport = _transport_details(read_error)
                     raw = b""
                 finally:
                     try:
                         error.close()
                     except (OSError, ValueError):
                         pass
-            except (OSError, ValueError, http.client.HTTPException):
-                raise HistoryError("欧易公开历史请求未完成，请检查当前代理、网络和证书；没有修改任何交易设置。") from None
+            except (OSError, ValueError, http.client.HTTPException) as error:
+                transport = _transport_details(error)
             if not isinstance(raw, bytes) or len(raw) > MAX_RESPONSE_BYTES:
-                raise HistoryError("历史响应过大，已停止下载。")
+                raise HistoryError("历史响应过大，已停止下载。", category="invalid_response")
             if http_failed and status is None:
-                raise HistoryError("公开历史请求发生无法识别的 HTTP 错误。")
+                raise HistoryError("公开历史请求发生无法识别的 HTTP 错误。", category="invalid_response")
             if status is not None and (type(status) is not int or not 100 <= status <= 599):
-                raise HistoryError("历史接口返回无效 HTTP 状态。")
+                raise HistoryError("历史接口返回无效 HTTP 状态。", category="invalid_response")
+            if transport is not None:
+                category, tls_failure, transient = transport
+                # A certificate/handshake failure cannot be relabelled as a
+                # recoverable 503. Conversely a 401/403/redirect must never be
+                # retried just because reading its error body disconnected.
+                permanent_http = (type(status) is int and not 200 <= status < 300
+                                  and not (status == 429 or status >= 500))
+                if category == "tls" or not permanent_http:
+                    if transient and attempt + 1 < self.max_attempts:
+                        if self._progress:
+                            self._progress(f"公开历史连接暂时中断，将进行第 {attempt + 2}/{self.max_attempts} 次只读重试。")
+                        self._sleep(attempt + 1)
+                        continue
+                    raise HistoryError(_transport_message(category, tls_failure, attempt + 1),
+                                       category=category, http_status=status, tls_failure=tls_failure) from None
             if type(status) is int and not 200 <= status < 300:
                 transient = status == 429 or status >= 500
+                error_code = None
+                try:
+                    error_code = _numeric_code(_json(raw))
+                except HistoryError:
+                    pass
+                if error_code == "0":
+                    error_code = None  # An HTTP error body cannot grant success.
+                if error_code is not None and error_code not in {"50001", "50004", "50011", "50013"}:
+                    transient = False
                 if transient and attempt + 1 < self.max_attempts:
                     if self._progress:
                         self._progress("公开历史接口暂时限流或不可用，将有限重试。")
                     self._sleep(attempt + 1)
                     continue
-                raise HistoryError(f"欧易公开历史请求返回 HTTP {status}；未使用响应中的任何行情。")
-            payload = _json(raw)
+                raise HistoryError(f"欧易公开历史请求返回 HTTP {status}；未使用响应中的任何行情。",
+                                   category="http", http_status=status, api_code=error_code)
+            try:
+                payload = _json(raw)
+            except HistoryError:
+                raise HistoryError("未收到有效的历史数据 JSON；不会使用不完整数据。",
+                                   category="invalid_response", http_status=status) from None
             code = _numeric_code(payload)
             if code != "0":
                 if code in {"50001", "50004", "50011", "50013"} and attempt + 1 < self.max_attempts:
@@ -210,9 +311,12 @@ class PublicHistoryClient:
                     self._sleep(attempt + 1)
                     continue
                 suffix = f"（代码 {code}）" if code else ""
-                raise HistoryError(f"欧易公开历史接口拒绝请求{suffix}；不会用替代数据继续。")
+                raise HistoryError(f"欧易公开历史接口拒绝请求{suffix}；不会用替代数据继续。",
+                                   category="api" if code is not None else "invalid_response",
+                                   http_status=status, api_code=code)
             if not isinstance(payload, dict) or not isinstance(payload.get("data"), list) or len(payload["data"]) > 100:
-                raise HistoryError("历史接口返回的数据结构或分页大小无效。")
+                raise HistoryError("历史接口返回的数据结构或分页大小无效。",
+                                   category="invalid_response", http_status=status)
             return payload["data"]
         raise HistoryError("欧易公开历史重试次数已用完。")
 
@@ -248,14 +352,18 @@ def _candle(row: Any, confirm_index: int, interval: int) -> Candle | None:
 
 
 def _fetch_candles(client: PublicHistoryClient, endpoint: str, inst_id: str, bar: str,
-                   first_ms: int, end_ms: int, progress: Callable[[str], Any] | None) -> list[Candle]:
+                   first_ms: int, end_ms: int, progress: Callable[[str], Any] | None,
+                   cache: Any = None) -> list[Candle]:
     interval = INTERVALS[bar]
     expected = (end_ms - first_ms) // interval
     collected: dict[int, Candle] = {}
     cursor = end_ms
     for _page in range((expected + 99) // 100 + 10):
-        rows = client.get(endpoint, {"instId": inst_id, "bar": bar, "after": str(cursor), "limit": "100"})
-        if not rows:
+        rows = cache.load(cursor) if cache is not None else None
+        cached = rows is not None
+        if not cached:
+            rows = client.get(endpoint, {"instId": inst_id, "bar": bar, "after": str(cursor), "limit": "100"})
+        if not isinstance(rows, list) or not 1 <= len(rows) <= 100:
             raise HistoryError("历史 K 线未覆盖所需区间，已停止；不会插值补齐。")
         timestamps: list[int] = []
         for row in rows:
@@ -264,6 +372,8 @@ def _fetch_candles(client: PublicHistoryClient, endpoint: str, inst_id: str, bar
             if ts > cursor or (timestamps and ts > timestamps[-1]):
                 raise HistoryError("历史接口分页顺序或方向无效。")
             timestamps.append(ts)
+            if candle is None and first_ms <= ts < end_ms:
+                raise HistoryError("所需历史 K 线尚未确认收盘，该页未保存；请稍后重新运行。")
             if candle is not None and first_ms <= ts < end_ms:
                 if ts in collected and collected[ts] != candle:
                     raise HistoryError("相同时间的历史 K 线内容冲突，已拒绝。")
@@ -271,9 +381,16 @@ def _fetch_candles(client: PublicHistoryClient, endpoint: str, inst_id: str, bar
         oldest = min(timestamps)
         if oldest >= cursor:
             raise HistoryError("历史分页游标没有向前推进，已停止。")
+        # Each accepted page must extend the already validated newest prefix.
+        # Never persist a cursor past a missing or unconfirmed wanted candle.
+        if any(ts not in collected for ts in range(max(oldest, first_ms), min(cursor, end_ms), interval)):
+            raise HistoryError("历史 K 线分页存在缺口，该页未保存；不会跳过或插值。")
+        if cache is not None and not cached:
+            cache.save(cursor, rows)
         if progress:
             kind = "成交价" if endpoint == ENDPOINTS["trade"] else "标记价格"
-            progress(f"已下载{kind}历史 K 线 {len(collected)}/{expected} 根。")
+            action = "已校验缓存" if cached else "已下载并保存" if cache is not None else "已下载"
+            progress(f"{action}{kind}历史 K 线 {len(collected)}/{expected} 根。")
         if oldest <= first_ms:
             break
         cursor = oldest
@@ -292,13 +409,17 @@ def _funding_row(row: Any, inst_id: str) -> tuple[int, Decimal]:
     return timestamp, _decimal(rate, rate=True)
 
 
-def _fetch_funding(client: PublicHistoryClient, inst_id: str, start_ms: int, end_ms: int) -> tuple[list[tuple[int, Decimal]], tuple[int, Decimal], tuple[int, Decimal] | None]:
+def _fetch_funding(client: PublicHistoryClient, inst_id: str, start_ms: int, end_ms: int,
+                   cache: Any = None) -> tuple[list[tuple[int, Decimal]], tuple[int, Decimal], tuple[int, Decimal] | None]:
     cursor = end_ms + 1
     collected: dict[int, Decimal] = {}
     # Even hourly settlement needs <= 2161 events for the 90-day maximum.
     for _page in range(100):
-        rows = client.get(ENDPOINTS["funding"], {"instId": inst_id, "after": str(cursor), "limit": "100"})
-        if not rows:
+        rows = cache.load(cursor) if cache is not None else None
+        cached = rows is not None
+        if not cached:
+            rows = client.get(ENDPOINTS["funding"], {"instId": inst_id, "after": str(cursor), "limit": "100"})
+        if not isinstance(rows, list) or not 1 <= len(rows) <= 100:
             raise HistoryError("资金费率历史未覆盖测量起点；不能将缺失数据当作零。")
         timestamps: list[int] = []
         for row in rows:
@@ -313,6 +434,8 @@ def _fetch_funding(client: PublicHistoryClient, inst_id: str, start_ms: int, end
         oldest = min(timestamps)
         if oldest >= cursor:
             raise HistoryError("资金费率历史分页没有推进。")
+        if cache is not None and not cached:
+            cache.save(cursor, rows)
         if oldest < start_ms:
             break
         cursor = oldest
@@ -381,7 +504,8 @@ def _validate(dataset: HistoryDataset) -> None:
 
 def fetch_dataset(config: Config, days: int = 30, now_ms: int | None = None,
                   progress: Callable[[str], Any] | None = None, *,
-                  warmup_bars: int | None = None) -> HistoryDataset:
+                  warmup_bars: int | None = None,
+                  checkpoint_dir: Path | None = None) -> HistoryDataset:
     if type(days) is not int or not 1 <= days <= 90:
         raise HistoryError("历史回测天数必须是 1 到 90 的整数。")
     inst_id = _inst_id(config.instrument)
@@ -404,9 +528,15 @@ def fetch_dataset(config: Config, days: int = 30, now_ms: int | None = None,
     instrument = _instrument(rows[0])
     if instrument.inst_id != inst_id:
         raise HistoryError("公开接口返回了其他合约元数据。")
-    trade = _fetch_candles(client, ENDPOINTS["trade"], inst_id, config.bar, first, end, progress)
-    mark = _fetch_candles(client, ENDPOINTS["mark"], inst_id, config.bar, first, end, progress)
-    funding, before, at_end = _fetch_funding(client, inst_id, start, end)
+    from .history_cache import HistoryPageCache
+    caches = {}
+    if checkpoint_dir is not None:
+        for kind in ("trade", "mark", "funding"):
+            caches[kind] = HistoryPageCache(checkpoint_dir, inst_id=inst_id, bar=config.bar,
+                start_ms=start if kind == "funding" else first, end_ms=end, kind=kind)
+    trade = _fetch_candles(client, ENDPOINTS["trade"], inst_id, config.bar, first, end, progress, caches.get("trade"))
+    mark = _fetch_candles(client, ENDPOINTS["mark"], inst_id, config.bar, first, end, progress, caches.get("mark"))
+    funding, before, at_end = _fetch_funding(client, inst_id, start, end, caches.get("funding"))
     dataset = HistoryDataset(trade, mark, funding, instrument, start, end, _now_ms(), config.bar, warmup, before, at_end)
     _validate(dataset)
     if progress:

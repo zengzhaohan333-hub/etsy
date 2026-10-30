@@ -125,6 +125,7 @@ class ResearchTests(unittest.TestCase):
             self.assertEqual([name for name, _ in calls],
                              [*DEFAULT_INSTRUMENTS[:3], *DEFAULT_INSTRUMENTS[2:]])
             self.assertTrue(all(options["now_ms"] == end and options["warmup_bars"] == 720
+                                and options["checkpoint_dir"] == state / "downloads"
                                 for _, options in calls))
             self.assertTrue((state / "report.html").exists())
 
