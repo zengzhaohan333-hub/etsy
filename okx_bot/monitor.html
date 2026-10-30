@@ -5,12 +5,13 @@
 </style></head><body><main>
 <header><div><div class="eyebrow">OKX BOT / DEMO MONITOR</div><h1>量化实验室 <span class="muted" style="font-size:14px;font-weight:400">欧易模拟盘</span></h1><div class="muted" id="strategy">正在读取机器人状态……</div></div><span class="badge" id="health">连接监控中</span></header>
 <div class="notice" id="notice" role="status">正在读取已选择的模拟盘状态文件。</div>
+<section class="panel" id="recoveryPanel" hidden aria-label="自动复核进度"><h2>自动复核进度 · 暂停新增交易</h2><dl class="details"><dt>进入复核已持续</dt><dd id="recoveryDuration">—</dd><dt>恢复轮次</dt><dd id="recoveryRound">—</dd><dt>下一轮间隔</dt><dd id="recoveryDelay">—</dd><dt>上次完整账户核对</dt><dd id="recoverySuccess">—</dd><dt>最近读取异常</dt><dd id="recoveryError">—</dd></dl><p class="warning-text" id="recoveryWarning"></p></section>
 <div class="cards"><div class="card"><div class="muted">模拟账户权益</div><div class="value"><span id="equity">—</span> <span class="unit">USDT</span></div><small id="equityFreshness">完整账户核对时间尚未提供；状态更新时间不代表权益已刷新。</small></div><div class="card"><div class="muted">本次确认入场</div><div class="value"><span id="entries">—</span> <span class="unit">次</span></div><small>不包含未确认或未完成保护核对的订单</small></div><div class="card"><div class="muted">当前仓位记录</div><div class="value" id="side">—</div><small id="positionHint">过期状态需到欧易核对</small></div><div class="card" id="ageCard"><div class="muted">距状态更新</div><div class="value"><span id="age">—</span> <span class="unit">秒</span></div><small id="updated">等待状态时间</small></div></div>
 <section id="portfolioSection" hidden aria-label="四币独立仓位"><h2>四币独立仓位记录</h2><p class="market-subtitle">BTC / ETH / SOL / XRP · 各自等待信号与管理仓位 · 共用一个模拟账户权益</p><div class="market-cards" id="marketCards"></div></section>
 <div class="grid"><section class="panel"><h2>账户权益变化 <small style="float:right;font-weight:400">本次监控收集的近期记录</small></h2><div class="chart-box"><canvas id="curve" aria-label="模拟账户权益曲线"></canvas><div class="empty" id="chartEmpty" style="position:absolute;inset:0">等待足够的账户状态更新后绘图。</div></div><div class="chart-labels"><span id="curveStart">—</span><span id="curveEnd">—</span></div></section><section class="panel"><h2>仓位与策略配置</h2><dl class="details"><dt id="positionLabel">方向</dt><dd id="positionSide">—</dd><dt id="quantityLabel">数量（张）</dt><dd id="contracts">—</dd><dt id="entryLabel">开仓均价</dt><dd id="entryPrice">—</dd><dt>止损 / 止盈距离</dt><dd id="protection">—</dd><dt id="capLabel">单笔名义上限</dt><dd id="cap">—</dd><dt>会话回撤阈值</dt><dd id="drawdown">—</dd></dl></section></div>
 <section class="panel"><h2>最近机器人订单日志</h2><div class="table-wrap"><table><thead><tr><th>创建时间 · 北京时间</th><th id="instrumentHeading" hidden>合约</th><th>方向</th><th>数量（张）</th><th>止损触发价</th><th>止盈触发价</th><th>记录状态</th><th>交易所订单号</th></tr></thead><tbody id="orders"><tr><td colspan="7" class="empty">正在读取……</td></tr></tbody></table></div><p class="muted" id="journalNote">日志用于查看机器人流程；成交、收益和止盈止损是否有效，以欧易模拟盘记录为准。</p></section>
 <div class="help"><a id="reportLink" href="/report" target="_blank" rel="noopener">查看已生成的历史回测报告</a><span class="muted">网页每 5 秒读取状态；机器人通常每 15 秒更新。</span></div>
-<footer><p>本页读取欧易模拟盘机器人上报的数据，无合成账户数据，不需要 API 密钥，也不会另外启动机器人或提交交易。</p><p>连续运行需要机器人窗口、电脑、网络和代理持续可用。状态超过 90 秒未更新会提示异常；电脑重启、断网和未解决订单不会由本页自动恢复。停止机器人不会自动平仓。</p><p>策略参数读取自所选机器人目录，运行中编辑配置不会自动改变已启动进程。关闭此网页或监控窗口不影响机器人。</p></footer>
+<footer><p>本页读取欧易模拟盘机器人上报的数据，无合成账户数据，不需要 API 密钥，也不会另外启动机器人或提交交易。</p><p>连续运行需要机器人、运行设备、网络和代理持续可用。本页只显示状态和自动复核进度，不会启动或恢复机器人。状态超过 90 秒未更新需检查后台服务或机器人窗口。停止机器人不会自动平仓。</p><p>策略参数来自监控程序选择的配置文件，运行中编辑配置不会自动改变已启动的机器人。关闭此网页或监控窗口不影响机器人。</p></footer>
 </main><script nonce="__NONCE__">
 'use strict';
 const $=id=>document.getElementById(id); let latest=null,receivedAt=0,polling=false;
@@ -41,10 +42,28 @@ function refreshTimes(){
   accountOld=elapsed>90000||elapsed<0;
   text=(hasChecked?'最近权益查询：':'最近完整核对（未提供独立权益查询时间）：')+date(success)+'；'+(elapsed<0?'电脑时间异常':num(elapsed/1000,0)+' 秒前')+'。';
  }
- if(latest.health==='retrying'||latest.health==='checking'||['retrying','checking'].includes(latest.connection?.state))text+=' 当前显示上次账户记录。';
+ if(isRecovering(latest))text+=' 暂停新增交易，当前显示上次账户记录。';
+ else if(latest.health==='retrying'||latest.health==='checking'||['retrying','checking'].includes(latest.connection?.state))text+=' 当前显示上次账户记录。';
  $('equityFreshness').textContent=text;
  $('equityFreshness').classList.toggle('warning-text',accountOld);
- refreshMarketTimes();
+ refreshMarketTimes();refreshRecovery();
+}
+function isRecovering(s){if(!s||s.halted===true||['halted','stopped'].includes(s.phase)||['halted','stopped'].includes(s.health))return false;return s.health==='recovering'||s.phase==='recovering'||s.connection?.state==='recovering';}
+function recoveryElapsed(s){
+ const r=s?.recovery||{},start=r.started_at_ms;
+ if(typeof start==='number'&&Number.isFinite(start)&&Date.now()>=start)return Math.floor((Date.now()-start)/1000);
+ return typeof r.elapsed_seconds==='number'&&Number.isFinite(r.elapsed_seconds)&&r.elapsed_seconds>=0?r.elapsed_seconds:null;
+}
+function refreshRecovery(){
+ if(!latest)return;const recovering=isRecovering(latest);$('recoveryPanel').hidden=!recovering;if(!recovering)return;
+ const r=latest.recovery||{},elapsed=recoveryElapsed(latest),round=r.round??r.attempt;
+ $('recoveryDuration').textContent=elapsed===null?'未提供':num(elapsed,0)+' 秒';
+ $('recoveryRound').textContent=typeof round==='number'&&Number.isFinite(round)?'第 '+num(round,0)+' 轮':'未提供';
+ $('recoveryDelay').textContent=[15,30,60].includes(r.delay_seconds)?r.delay_seconds+' 秒':'等待复核安排';
+ $('recoverySuccess').textContent=date(latest.last_success_at_ms);
+ $('recoveryError').textContent=r.last_error_message||'账户、订单与保护单仍需完整复核。';
+ const age=ageNow(),stale=latest.stale===true||(age!==null&&(age>90000||age<0));
+ $('recoveryWarning').textContent=stale?'心跳记录已过期，无法确认后台仍在继续自动复核。请检查服务或机器人窗口，并到欧易核对实际仓位与保护单。':elapsed!==null&&elapsed>=600?'自动复核已超过 10 分钟。请人工检查服务、网络与代理，并到欧易核对实际仓位和保护单；期间仍暂停新增交易。':r.warning===true?'自动复核持续较久，请人工检查服务、网络、代理及欧易仓位。':'仅在账户、四币仓位、订单及保护单完整复核成功后恢复新增交易；本页不会替机器人发单或平仓。';
 }
 function refreshMarketTimes(){
  if(latest?.scope!=='portfolio')return;
@@ -55,6 +74,12 @@ function refreshMarketTimes(){
   target.textContent=valid?'最近核对：'+date(timestamp)+' · '+(elapsed<0?'电脑时间异常':num(elapsed/1000,0)+' 秒前'):'未提供完整核对时间，不能视为当前空仓。';
   const uncertain=market?.position?.uncertain||!market;
   card.classList.toggle('warn',old||uncertain);target.classList.toggle('warning-text',old||uncertain);
+  const protection=$('market-protection-'+instrument),checked=market?.protection_checked_at_ms;
+  if(protection){
+   const validProtection=typeof checked==='number'&&Number.isFinite(checked),delta=validProtection?Date.now()-checked:null;
+   protection.textContent=validProtection?'上次保护单核对：'+date(checked)+' · '+(delta<0?'电脑时间异常':num(delta/1000,0)+' 秒前'):market&&market.position===null&&!marketUncertain(market)?'上次完整核对记录为空仓。':'未提供保护单核对时间；请以欧易实际记录为准。';
+   protection.classList.toggle('warning-text',uncertain||(validProtection&&(delta>90000||delta<0)));
+  }
  }
 }
 function marketUncertain(market){return !market||!Object.prototype.hasOwnProperty.call(market,'position')||market.position?.uncertain||typeof market.last_success_at_ms!=='number'||!Number.isFinite(market.last_success_at_ms);}
@@ -66,17 +91,17 @@ function marketSummary(s){
 function renderMarkets(s){
  const portfolio=s.scope==='portfolio';$('portfolioSection').hidden=!portfolio;$('instrumentHeading').hidden=!portfolio;
  const container=$('marketCards');container.replaceChildren();if(!portfolio)return;
- const phases={starting:'初始化中',running:'运行中',waiting:'等待信号',holding:'持仓管理中',stopped:'用户已停止',halted:'停止待核对'};
+ const phases={starting:'初始化中',running:'运行中',waiting:'等待信号',holding:'持仓管理中',recovering:'暂停新增，自动复核中',stopped:'用户已停止',halted:'停止待核对'};
  for(const instrument of MARKET_IDS){
   const market=s.markets?.[instrument],position=market?.position,uncertain=marketUncertain(market);
   const card=document.createElement('article');card.className='market-card';card.id='market-card-'+instrument;
   const title=document.createElement('h3');title.textContent=instrument;card.append(title);
-  const phase=document.createElement('small');phase.textContent=phases[market?.phase]||'状态待核对';card.append(phase);
+  const phase=document.createElement('small'),shownPhase=s.halted||s.phase==='halted'?'halted':s.phase==='stopped'?'stopped':market?.phase;phase.textContent=phases[shownPhase]||'状态待核对';card.append(phase);
   const direction=document.createElement('div');direction.className='direction';direction.textContent=uncertain?'待核对':side(position?.side);card.append(direction);
   const details=document.createElement('dl');
   const pairs=[['数量（张）',uncertain?'待核对':position?num(position.contracts,4):'—'],['开仓均价',uncertain?'待核对':position?num(position.entry_price):'—'],['本次确认入场',num(market?.entries,0)+' 次'],['标记价格',num(market?.mark_price)],['仓位名义价值',num(market?.notional)+' USDT']];
   for(const [label,value] of pairs){const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=label;dd.textContent=value;details.append(dt,dd);}card.append(details);
-  const time=document.createElement('div');time.id='market-time-'+instrument;time.className='check-time';card.append(time);container.append(card);
+  const time=document.createElement('div');time.id='market-time-'+instrument;time.className='check-time';card.append(time);const protection=document.createElement('small');protection.id='market-protection-'+instrument;card.append(protection);container.append(card);
  }
  refreshMarketTimes();
 }
@@ -91,6 +116,7 @@ function showHealth(s){
  const halted=s.halted===true||raw==='halted'||s.phase==='halted';
  const stopped=raw==='stopped'||s.phase==='stopped';
  const age=ageNow(),stale=s.stale===true||raw==='stale'||(age!==null&&(age>90000||age<0));
+ const recovering=isRecovering(s);
  const retrying=raw==='retrying'||connection?.state==='retrying';
  const checking=raw==='checking'||s.phase==='starting'||connection?.state==='checking';
  if(halted){
@@ -102,9 +128,10 @@ function showHealth(s){
  }
  if(stale){
   badge('状态记录已过期','warn');
-  const detail=retrying?retryText(connection):checking?'正在恢复核对账户、订单与保护单，完整核对完成前不恢复新开仓。':'请检查机器人窗口、网络和代理，并到欧易核对仓位。';
+  const detail=recovering?'上次记录处于自动复核阶段；当前心跳已过期，无法确认服务仍在继续复核。请检查后台服务或机器人窗口。':retrying?retryText(connection):checking?'正在恢复核对账户、订单与保护单，完整核对完成前不恢复新开仓。':'请检查机器人窗口、网络和代理，并到欧易核对仓位。';
   message('状态超过 90 秒未更新或电脑时间异常。当前显示上次记录。'+detail,'warn');return;
  }
+ if(recovering){badge('暂停新增 · 自动复核中','warn');message('暂停新增交易，正在自动复核连接、仓位与保护单。当前保留上次已知记录，不能据此确认保护单仍然有效；仅在完整核对成功后恢复新增交易。','warn');return;}
  if(retrying){badge('连接重试中','warn');message(retryText(connection),'warn');return;}
  if(checking){badge('恢复核对中','warn');message('正在核对账户、订单与保护单，尚未确认恢复正常。当前显示上次账户记录，完整检查完成前不恢复新开仓。','warn');return;}
  if(raw==='unavailable'||['failed','blocked'].includes(connection?.state)){
@@ -135,7 +162,7 @@ function render(s){
  else{$('side').textContent=s.position?.uncertain?'待核对':side(s.position?.side);$('positionSide').textContent=$('side').textContent;$('positionHint').textContent='过期状态需到欧易核对';$('contracts').textContent=s.position?.uncertain?'待核对':s.position?num(s.position.contracts,4):'—';$('entryPrice').textContent=s.position?.uncertain?'待核对':s.position?num(s.position.entry_price):'—';}
  refreshTimes();
  $('strategy').textContent=[portfolio?'四币 BTC / ETH / SOL / XRP':p.instrument||'欧易模拟盘',p.bar||s.bar||'周期未提供',p.fast_window&&p.slow_window?`均线 ${p.fast_window} / ${p.slow_window}`:'参数见启动窗口'].join(' · ');$('protection').textContent=pct(p.stop_loss_pct)+' / '+pct(p.take_profit_pct);const cap=portfolio?s.max_notional_per_market??p.max_notional:p.max_notional;$('cap').textContent=cap!==null&&cap!==undefined?num(cap)+' USDT':'—';$('drawdown').textContent=pct(p.max_drawdown_pct);
- const statuses={intent:'已记录下单意图',accepted:'交易所已受理',protected:'已确认成交与保护',closed:'已核对结束',inspect_required:'需要人工核对',never_submitted:'未提交已取消',unknown:'待核对'},tbody=$('orders');tbody.replaceChildren();
+ const statuses={intent:'已记录下单意图',accepted:'交易所已受理',protected:isRecovering(s)?'上次已确认成交与保护':'已确认成交与保护',closed:'已核对结束',inspect_required:'需要人工核对',never_submitted:'未提交已取消',unknown:'待核对'},tbody=$('orders');tbody.replaceChildren();
  if(!s.orders?.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=portfolio?8:7;td.className='empty';td.textContent='暂无机器人订单记录。';tr.append(td);tbody.append(tr);}
  for(const r of s.orders||[]){const tr=document.createElement('tr');const values=[date(r.created_at_ms)];if(portfolio)values.push(MARKET_IDS.includes(r.instrument)?r.instrument:'—');values.push(side(r.side),num(r.size,4),num(r.stop_loss),num(r.take_profit),statuses[r.status]||'待核对',r.order_id||'—');values.forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.append(td);});tbody.append(tr);}
  $('journalNote').textContent=s.warning||'日志用于查看机器人流程；成交、收益和止盈止损是否有效，以欧易模拟盘记录为准。';chart(s.equity_curve);

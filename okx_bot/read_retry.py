@@ -18,6 +18,7 @@ _READ_METHODS = frozenset({
     "instrument", "candles", "server_time", "mark_price", "account_config",
     "positions", "pending_orders", "pending_algos", "pending_algo_orders",
     "get_leverage", "balances", "query_order",
+    "swap_positions", "swap_pending_orders", "swap_pending_algos", "swap_mark_prices",
 })
 _CATEGORIES = frozenset({
     "local", "api", "http", "redirect", "proxy", "rate_limit", "server",
@@ -28,6 +29,26 @@ _CATEGORIES = frozenset({
 _TRANSIENT_API_CODES = frozenset({"50001", "50011", "50004", "50013"})
 _DENIED_CATEGORIES = frozenset({"tls", "invalid_response", "credential_format"})
 _TLS_FAILURES = frozenset({"certificate", "unexpected_eof", "handshake"})
+
+
+class ReadUnavailable(OkxError):
+    """Proven read-only transient exhaustion; never an order/mutation result.
+
+    The message and method tag are fixed local diagnostics. No original error
+    text, URL, parameters, response body or credential-bearing cause is copied.
+    """
+
+    def __init__(self, *, read_method: str, api_code=None, http_status=None,
+                 category="local", tls_failure=None, budget_exhausted=False):
+        if type(read_method) is not str or read_method not in _READ_METHODS:
+            raise ValueError("ReadUnavailable requires a known read-only method")
+        if type(budget_exhausted) is not bool:
+            raise ValueError("budget_exhausted must be a boolean")
+        super().__init__("Read-only exchange verification unavailable; new entries remain paused",
+                         api_code=api_code, http_status=http_status, category=category,
+                         tls_failure=tls_failure)
+        self.read_method = read_method
+        self.budget_exhausted = budget_exhausted
 
 
 def _diagnostics(error: OkxError) -> tuple[str, str | None, int | None, str | None, bool]:
@@ -54,7 +75,7 @@ def _diagnostics(error: OkxError) -> tuple[str, str | None, int | None, str | No
 
 def _retryable(error: OkxError) -> bool:
     category, code, status, tls_failure, fields_valid = _diagnostics(error)
-    if (not fields_valid or isinstance(error, AmbiguousOrderError)
+    if (not fields_valid or isinstance(error, (AmbiguousOrderError, ReadUnavailable))
             or category in _DENIED_CATEGORIES or status in (401, 403)
             or tls_failure in {"certificate", "handshake"}):
         return False
@@ -82,9 +103,12 @@ class ReadRetryClient:
     """
 
     def __init__(self, client: Any, stop: Any, *, on_retry=None,
-                 on_recovered=None, max_attempts: int = 3, clock=None):
+                 on_recovered=None, max_attempts: int = 3, clock=None,
+                 classify_exhausted: bool = False):
         if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
             raise ValueError("max_attempts must be an integer between 1 and 3")
+        if type(classify_exhausted) is not bool:
+            raise ValueError("classify_exhausted must be a boolean")
         self._client = client
         self._stop = stop
         self._on_retry = on_retry
@@ -92,6 +116,7 @@ class ReadRetryClient:
         self._max_attempts = max_attempts
         self._clock = clock if clock is not None else time.monotonic
         self._deadline = None
+        self._classify_exhausted = classify_exhausted
 
     def begin_cycle(self, seconds: float = 60) -> None:
         """Set one deadline shared by all subsequent reads until reset.
@@ -104,8 +129,10 @@ class ReadRetryClient:
             raise ValueError("Cycle time budget must be a positive finite number of seconds")
         self._deadline = self._clock() + seconds
 
-    def _check_budget(self) -> None:
+    def _check_budget(self, read_method: str | None = None) -> None:
         if self._deadline is not None and self._clock() >= self._deadline:
+            if self._classify_exhausted and read_method in _READ_METHODS:
+                raise ReadUnavailable(read_method=read_method, budget_exhausted=True) from None
             raise OkxError("Read verification time budget exceeded; inspect exchange state",
                            category="local") from None
 
@@ -119,15 +146,23 @@ class ReadRetryClient:
             for attempt in range(1, self._max_attempts + 1):
                 if last_error is not None and self._stop.is_set():
                     raise last_error
-                self._check_budget()
+                self._check_budget(name)
                 try:
                     result = method(*args, **kwargs)
                 except OkxError as error:
                     if self._stop.is_set():
                         raise
-                    self._check_budget()
+                    # A late permanent/authentication error must not be hidden
+                    # behind a recoverable budget exception in service mode.
+                    if self._classify_exhausted and not _retryable(error):
+                        raise
+                    self._check_budget(name)
                     if (attempt >= self._max_attempts or not _retryable(error)
                             or self._stop.is_set()):
+                        if self._classify_exhausted and _retryable(error):
+                            category, code, status, tls_failure, _valid = _diagnostics(error)
+                            raise ReadUnavailable(read_method=name, api_code=code, http_status=status,
+                                                  category=category, tls_failure=tls_failure) from None
                         raise
                     category, code, status, tls_failure, _valid = _diagnostics(error)
                     if self._on_retry is not None:
@@ -136,8 +171,10 @@ class ReadRetryClient:
                                  "category": category, "api_code": code, "http_status": status}
                         if tls_failure is not None:
                             event["tls_failure"] = tls_failure
+                        if self._classify_exhausted:
+                            event["read_method"] = name
                         self._on_retry(event)
-                    self._check_budget()
+                    self._check_budget(name)
                     if self._stop.is_set():
                         raise
                     delay = 2 ** attempt
@@ -146,13 +183,13 @@ class ReadRetryClient:
                     interrupted = self._stop.wait(delay)
                     if interrupted or self._stop.is_set():
                         raise
-                    self._check_budget()
+                    self._check_budget(name)
                     last_error = error
                 else:
-                    self._check_budget()
+                    self._check_budget(name)
                     if attempt > 1 and self._on_recovered is not None:
                         self._on_recovered()
-                    self._check_budget()
+                    self._check_budget(name)
                     return result
             raise AssertionError("Unreachable retry state")
 

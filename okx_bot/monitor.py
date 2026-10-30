@@ -79,7 +79,8 @@ def _markets(state):
             "position": position,
             "entries": entries if type(entries) is int and entries >= 0 else None,
             "last_success_at_ms": _timestamp(value.get("last_success_at_ms")),
-            "phase": phase if type(phase) is str and phase in {"starting", "running", "waiting", "holding", "stopped", "halted"} else None,
+            "protection_checked_at_ms": _timestamp(value.get("protection_checked_at_ms")),
+            "phase": phase if type(phase) is str and phase in {"starting", "running", "waiting", "holding", "recovering", "stopped", "halted"} else None,
             "last_candle_ts": _timestamp(value.get("last_candle_ts")),
             "mark_price": _positive_number(value.get("mark_price")),
             "notional": _positive_number(value.get("notional"), zero=True),
@@ -95,14 +96,10 @@ def _tls_failure(category, value):
     return value if value in allowed.get(category, set()) else None
 
 
-def _connection(value):
-    if (not isinstance(value, dict) or type(value.get("state")) is not str
-            or value["state"] not in {"checking", "connected", "retrying", "failed", "blocked"}):
-        return None
-    result = {"state": value["state"]}
-    for field in ("attempt", "max_attempts"):
-        if type(value.get(field)) is int and 0 <= value[field] <= 3:
-            result[field] = value[field]
+def _diagnostics(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
     category = value.get("category")
     if type(category) is str and category in _CONNECTION_CATEGORIES:
         result["category"] = category
@@ -115,6 +112,64 @@ def _connection(value):
     http_status = value.get("http_status")
     if type(http_status) is int and 100 <= http_status <= 599:
         result["http_status"] = http_status
+    return result
+
+
+def _connection(value):
+    if (not isinstance(value, dict) or type(value.get("state")) is not str
+            or value["state"] not in {"checking", "connected", "retrying", "recovering", "failed", "blocked"}):
+        return None
+    result = {"state": value["state"]}
+    for field in ("attempt", "max_attempts"):
+        if type(value.get(field)) is int and 0 <= value[field] <= 3:
+            result[field] = value[field]
+    result.update(_diagnostics(value))
+    return result
+
+
+def _recovery_error_message(error):
+    """Recovery hints describe the read fault, never claim trading has resumed."""
+    if not error:
+        return "未记录可识别的读取异常，账户和订单仍需完整复核。"
+    code = error.get("api_code")
+    meanings = {"50001": "欧易服务维护或暂不可用。", "50013": "欧易服务暂不可用。",
+                "50011": "读取请求受到限流。", "50004": "读取请求超时。"}
+    if code in meanings:
+        return meanings[code]
+    subtype = error.get("tls_failure")
+    if subtype == "unexpected_eof":
+        return "TLS 连接被提前关闭，请检查代理稳定性。"
+    if subtype == "certificate":
+        return "HTTPS 证书验证失败，请检查系统时间与证书链，保留证书校验。"
+    if subtype == "handshake":
+        return "TLS 握手失败，请检查代理连接，保留证书校验。"
+    categories = {"timeout": "读取欧易数据超时。", "dns": "域名解析失败。",
+                  "transport": "读取连接中断。", "tls": "HTTPS/TLS 连接核对尚未完成。",
+                  "server": "欧易服务暂不可用。", "rate_limit": "读取请求受到限流。",
+                  "proxy": "代理连接尚未恢复。", "http": "读取请求返回 HTTP 异常。"}
+    if error.get("category") in categories:
+        return categories[error["category"]]
+    if code is not None:
+        return f"欧易读取返回 API 代码 {code}。"
+    return "读取核对尚未完成，请以欧易实际仓位和保护单为准。"
+
+
+def _recovery(value, now):
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    for field in ("attempt", "round", "elapsed_seconds"):
+        if type(value.get(field)) is int and 0 <= value[field] <= 1_000_000_000:
+            result[field] = value[field]
+    if type(value.get("delay_seconds")) is int and value["delay_seconds"] in {15, 30, 60}:
+        result["delay_seconds"] = value["delay_seconds"]
+    started = _timestamp(value.get("started_at_ms"))
+    result["started_at_ms"] = started
+    if started is not None and now >= started:
+        result["elapsed_seconds"] = min((now - started) // 1000, 1_000_000_000)
+    result["warning"] = result.get("elapsed_seconds", 0) >= 600 or value.get("warning") is True
+    result["last_error"] = _diagnostics(value.get("last_error"))
+    result["last_error_message"] = _recovery_error_message(result["last_error"])
     return result
 
 
@@ -154,6 +209,10 @@ def _halt_message(state):
              "Read verification time budget exceeded; inspect exchange state": "账户或订单读取核对超过时间预算，请检查网络并核对欧易状态。",
              "Session drawdown limit reached; new entries stopped; any reported position remains open": "会话权益触及回撤阈值，已停止新增交易；已有仓位不会自动平仓。",
              "Portfolio session drawdown limit reached; all new entries stopped; existing positions remain open": "共享账户权益触及会话回撤阈值，四币均已停止新增交易；已有仓位不会自动平仓。",
+             "Persistent session drawdown stop is latched; manual review is required": "会话回撤停止已持久锁定，重启不会解除；请人工复核账户风险、仓位与原风控状态。",
+             "Risk session is missing; explicit read-only initialization is required": "未找到服务风控会话，请完成首次部署核对与显式初始化；若原文件丢失，应恢复可靠备份。",
+             "Risk state belongs to a different account or strategy; manual review is required": "账户或策略配置与原风控状态不一致，已停止交易；请核对配置与配对状态文件。",
+             "Order journal is missing for an existing service session; manual review is required": "缺少与风控会话配对的订单日志，已停止交易；请恢复并核对原日志，不能新建空文件绕过。",
              "Portfolio mark price is stale or invalid": "四币核对中的标记价格过期或无效，组合已停止，请检查行情连接与实际仓位。",
              "Missed candle interval; restart safely instead of trading old signals": "行情 K 线出现跨周期缺口，机器人停止并保留核对要求。"}
     return known.get(reason, "机器人记录异常停止，请查看启动窗口并到欧易核对订单与保护单。") if type(reason) is str else "机器人记录异常停止，请到欧易核对订单与保护单。"
@@ -168,19 +227,24 @@ def _read(path):
 
 
 class DemoMonitor:
-    def __init__(self, status_file: Path):
+    def __init__(self, status_file: Path, config_file: Path | None = None):
         self.status_file = Path(status_file)
         if self.status_file.name != "status.json":
-            raise ValueError("请选择正在运行机器人 .runtime-demo 中的 status.json")
+            raise ValueError("请选择正在运行机器人写入的 status.json")
+        # This override is an operator-selected local path. Status payloads and
+        # HTTP parameters can never choose a configuration file for the monitor.
+        self.config_file = Path(config_file) if config_file is not None else None
         self.curve = deque(maxlen=2000)
         self.lock = threading.Lock()
 
     def _profile(self, scope="single"):
         result = {}
         try:
-            # Fixed sibling config filename only; unknown fields never leave.
+            # Only the explicit CLI path or fixed legacy sibling is read; unknown
+            # configuration fields and credentials never leave this monitor.
             filename = "config.portfolio.toml" if scope == "portfolio" else "config.paper.toml"
-            with (self.status_file.parent.parent / filename).open("rb") as stream:
+            config_file = self.config_file if self.config_file is not None else self.status_file.parent.parent / filename
+            with config_file.open("rb") as stream:
                 raw = stream.read(64 * 1024 + 1)
             if len(raw) > 64 * 1024:
                 return result
@@ -246,7 +310,8 @@ class DemoMonitor:
             age = now - updated
             stale = age > MAX_AGE_MS or age < -5_000
             connection = _connection(state.get("connection"))
-            phase = state.get("phase") if state.get("phase") in {"starting", "running", "stopped", "halted"} else None
+            phase = state.get("phase") if state.get("phase") in {"starting", "running", "recovering", "stopped", "halted"} else None
+            recovery = _recovery(state.get("recovery"), now)
             last_success = _timestamp(state.get("last_success_at_ms"))
             equity_checked = _timestamp(state.get("equity_checked_at_ms"))
             has_equity_time = "equity_checked_at_ms" in state
@@ -315,15 +380,17 @@ class DemoMonitor:
                     "stale": stale, "updated_at_ms": updated, "age_ms": max(0, age),
                     "equity": equity, "entries": state["entries"], "position": clean_position,
                     "phase": phase, "connection": connection, "last_success_at_ms": last_success,
+                    "recovery": recovery,
                     "equity_checked_at_ms": equity_checked,
                     "halt_message": _halt_message(state),
                     "profile": self._profile(scope), "orders": orders, "warning": warning,
                     "equity_curve": curve,
                     "health": ("halted" if state["halted"] else "stopped" if phase == "stopped"
-                               else "stale" if stale else connection["state"] if connection is not None
-                               and connection["state"] in {"retrying", "checking"} else "updating")}
+                               else "stale" if stale else "recovering" if phase == "recovering"
+                               else connection["state"] if connection is not None
+                               and connection["state"] in {"retrying", "checking", "recovering"} else "updating")}
         except (OSError, ValueError, TypeError, RecursionError):
-            return {"ok": False, "health": "unavailable", "error": "无法读取有效的欧易模拟盘状态。请确认选择了正在运行机器人目录中的 .runtime-demo/status.json。"}
+            return {"ok": False, "health": "unavailable", "error": "无法读取有效的欧易模拟盘状态。请确认选择了正在运行机器人写入的 status.json，并检查监控进程是否有读取权限。"}
 
 
 def handler_for(monitor: DemoMonitor, report_file: Path | None = None):
@@ -373,7 +440,7 @@ def handler_for(monitor: DemoMonitor, report_file: Path | None = None):
                         raise ValueError()
                     return self._send(200, report, "text/html; charset=utf-8")
                 except (OSError, ValueError):
-                    return self._send(404, "尚未生成回测报告。请先运行 backtest-windows.bat。".encode(), "text/plain; charset=utf-8")
+                    return self._send(404, "尚未找到历史回测报告。请先运行历史回测，再选择生成的报告。".encode(), "text/plain; charset=utf-8")
             self._send(404, b"Not found", "text/plain; charset=utf-8")
 
         def do_POST(self):
@@ -385,13 +452,15 @@ def handler_for(monitor: DemoMonitor, report_file: Path | None = None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="量化实验室：只读查看正在运行的欧易模拟盘，不启动新机器人")
     parser.add_argument("--status-file", type=Path, default=Path(".runtime-demo/status.json"))
+    parser.add_argument("--config-file", type=Path,
+                        help="显式选择本机策略 TOML 文件，例如 /etc/okxbot/config.portfolio.toml")
     parser.add_argument("--report-file", type=Path, default=Path(".runtime-backtest/report.html"))
     parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args(argv)
     try:
         if not 1 <= args.port <= 65535:
             raise ValueError()
-        monitor = DemoMonitor(args.status_file)
+        monitor = DemoMonitor(args.status_file, config_file=args.config_file)
         with ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(monitor, args.report_file)) as server:
             print(f"欧易模拟盘监控已启动，请在浏览器打开 http://127.0.0.1:{args.port}", flush=True)
             print("保持此窗口运行。关闭网页不影响机器人；关闭此监控窗口也不会停止机器人。", flush=True)

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 from okx_bot.okx import AmbiguousOrderError, Credentials, OkxClient, OkxError
-from okx_bot.read_retry import ReadRetryClient
+from okx_bot.read_retry import ReadRetryClient, ReadUnavailable
 
 
 class Stop:
@@ -508,6 +508,102 @@ class RetryTests(unittest.TestCase):
         for seconds in (0, -1, True, '60', float('nan'), float('inf')):
             with self.subTest(seconds=seconds), self.assertRaises(ValueError):
                 self.wrapper().begin_cycle(seconds)
+
+    def test_service_mode_classifies_only_exhausted_transient_reads_with_safe_origin(self):
+        original = OkxError('fake-key fake-secret fake-passphrase', api_code='50001', category='api', http_status=200)
+        self.client.balances = Mock(side_effect=original)
+        wrapper = self.wrapper(classify_exhausted=True)
+        wrapper.begin_cycle(60)
+        with self.assertRaises(ReadUnavailable) as raised:
+            wrapper.balances()
+        error = raised.exception
+        self.assertEqual(error.read_method, 'balances')
+        self.assertEqual(error.api_code, '50001')
+        self.assertEqual(error.http_status, 200)
+        self.assertFalse(error.budget_exhausted)
+        self.assertEqual(self.client.balances.call_count, 3)
+        self.assertEqual(self.stop.delays, [2, 4])
+        self.assertEqual([event['read_method'] for event in self.events], ['balances', 'balances'])
+        self.assertNotIn('fake-', str(error) + repr(error.__dict__) + repr(self.events))
+
+    def test_service_mode_budget_failure_has_real_read_method_and_no_late_data(self):
+        now = [0.0]
+        self.client.swap_positions = Mock(side_effect=lambda: now.__setitem__(0, 61) or [])
+        wrapper = self.wrapper(classify_exhausted=True, clock=lambda: now[0])
+        wrapper.begin_cycle(60)
+        with self.assertRaises(ReadUnavailable) as raised:
+            wrapper.swap_positions()
+        self.assertEqual(raised.exception.read_method, 'swap_positions')
+        self.assertTrue(raised.exception.budget_exhausted)
+        self.assertEqual(raised.exception.category, 'local')
+        self.assertEqual(self.client.swap_positions.call_count, 1)
+
+    def test_service_mode_does_not_hide_permanent_or_ambiguous_errors_after_deadline(self):
+        for original in (OkxError('safe auth', api_code='50110', category='api'),
+                         OkxError('safe TLS', category='tls', tls_failure='certificate'),
+                         OkxError('invalid data', category='invalid_response'),
+                         AmbiguousOrderError('unknown order', category='transport')):
+            with self.subTest(category=original.category):
+                now = [0.0]
+                def fail():
+                    now[0] = 61
+                    raise original
+                self.client.account_config = Mock(side_effect=fail)
+                wrapper = self.wrapper(classify_exhausted=True, clock=lambda: now[0])
+                wrapper.begin_cycle(60)
+                with self.assertRaises(OkxError) as raised:
+                    wrapper.account_config()
+                self.assertIs(raised.exception, original)
+                self.assertNotIsInstance(raised.exception, ReadUnavailable)
+                self.assertEqual(self.client.account_config.call_count, 1)
+
+    def test_service_mode_never_classifies_or_retries_any_mutation(self):
+        original = OkxError('safe maintenance', api_code='50001', category='api')
+        for name in ('place_market_order', 'set_leverage', 'unknown_callable'):
+            with self.subTest(name=name):
+                method = Mock(side_effect=original)
+                setattr(self.client, name, method)
+                with self.assertRaises(OkxError) as raised:
+                    getattr(self.wrapper(classify_exhausted=True), name)()
+                self.assertIs(raised.exception, original)
+                self.assertNotIsInstance(raised.exception, ReadUnavailable)
+                method.assert_called_once_with()
+        self.assertEqual(self.events, [])
+
+    def test_service_mode_cancellation_preserves_original_read_error(self):
+        original = OkxError('safe timeout', category='timeout')
+        self.client.balances = Mock(side_effect=original)
+        def stop_wait():
+            self.stop.stopped = True
+            return True
+        self.stop.during_wait = stop_wait
+        with self.assertRaises(OkxError) as raised:
+            self.wrapper(classify_exhausted=True).balances()
+        self.assertIs(raised.exception, original)
+        self.assertEqual(self.client.balances.call_count, 1)
+
+    def test_service_mode_bulk_reads_are_allowlisted_and_already_classified_not_retried(self):
+        for name, args in (('swap_positions', ()), ('swap_pending_orders', ()),
+                           ('swap_pending_algos', ('oco',)), ('swap_mark_prices', ())):
+            with self.subTest(name=name):
+                method = Mock(side_effect=[OkxError('safe timeout', category='timeout'), []])
+                setattr(self.client, name, method)
+                self.assertEqual(getattr(self.wrapper(classify_exhausted=True), name)(*args), [])
+                self.assertEqual(method.call_count, 2)
+        error = ReadUnavailable(read_method='swap_positions', category='transport')
+        self.client.swap_positions = Mock(side_effect=error)
+        with self.assertRaises(ReadUnavailable) as raised:
+            self.wrapper(classify_exhausted=True).swap_positions()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.client.swap_positions.call_count, 1)
+
+    def test_read_unavailable_requires_fixed_known_read_method_and_boolean_mode(self):
+        for method in ('place_market_order', 'fake-secret', None, []):
+            with self.subTest(type=type(method).__name__), self.assertRaises(ValueError):
+                ReadUnavailable(read_method=method)
+        for option in (1, None, 'yes'):
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                self.wrapper(classify_exhausted=option)
 
 
 if __name__ == '__main__':

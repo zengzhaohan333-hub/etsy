@@ -466,6 +466,30 @@ class OkxClient:
         """Alias used by execution preflight and protective-order reconciliation."""
         return self.pending_algos(inst_id)
 
+    def swap_positions(self) -> list[dict[str, Any]]:
+        """Read all SWAP positions for validated account-wide reconciliation."""
+        return self._request("GET", "/api/v5/account/positions", params={"instType": "SWAP"}, private=True)
+
+    def swap_pending_orders(self) -> list[dict[str, Any]]:
+        rows = self._request("GET", "/api/v5/trade/orders-pending",
+                             params={"instType": "SWAP", "limit": "100"}, private=True)
+        if len(rows) >= 100:
+            raise OkxError("SWAP pending-order page may be incomplete; inspect account activity", category="invalid_response")
+        return rows
+
+    def swap_pending_algos(self, order_type: str) -> list[dict[str, Any]]:
+        if type(order_type) is not str or order_type not in {"conditional", "oco", "trigger", "move_order_stop"}:
+            raise OkxError("Unsupported SWAP algorithmic order family")
+        rows = self._request("GET", "/api/v5/trade/orders-algo-pending",
+                             params={"instType": "SWAP", "ordType": order_type, "limit": "100"}, private=True)
+        if len(rows) >= 100:
+            raise OkxError("SWAP algorithmic-order page may be incomplete; inspect account activity", category="invalid_response")
+        return rows
+
+    def swap_mark_prices(self) -> list[dict[str, Any]]:
+        """Public demo-environment marks for SWAP instruments, without auth."""
+        return self._request("GET", "/api/v5/public/mark-price", params={"instType": "SWAP"})
+
     def get_leverage(self, inst_id: str) -> list[dict[str, Any]]:
         self._instrument_id(inst_id)
         return self._request("GET", "/api/v5/account/leverage-info",

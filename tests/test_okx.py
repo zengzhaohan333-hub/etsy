@@ -633,6 +633,39 @@ class OkxTests(unittest.TestCase):
         self.assertEqual(len(transport.requests), 1)
         self.assert_safe_diagnostic(raised.exception)
 
+    def test_account_wide_swap_reads_are_demo_gets_without_instrument_filter(self):
+        cases = [('swap_positions', (), '/api/v5/account/positions', {'instType': ['SWAP']}),
+                 ('swap_pending_orders', (), '/api/v5/trade/orders-pending', {'instType': ['SWAP'], 'limit': ['100']}),
+                 ('swap_pending_algos', ('oco',), '/api/v5/trade/orders-algo-pending',
+                  {'instType': ['SWAP'], 'ordType': ['oco'], 'limit': ['100']})]
+        for name, args, endpoint, expected in cases:
+            with self.subTest(name=name):
+                transport = Transport(data=[])
+                self.assertEqual(getattr(self.client(transport), name)(*args), [])
+                request = transport.requests[0][0]
+                parsed = urllib.parse.urlsplit(request.full_url)
+                self.assertEqual(request.get_method(), 'GET')
+                self.assertEqual(parsed.path, endpoint)
+                self.assertEqual(urllib.parse.parse_qs(parsed.query), expected)
+                self.assertEqual(dict((k.lower(), v) for k, v in request.header_items())['x-simulated-trading'], '1')
+
+    def test_swap_bulk_mark_request_is_public_and_has_no_credentials(self):
+        transport = Transport(data=[])
+        self.client(transport).swap_mark_prices()
+        request = transport.requests[0][0]
+        self.assertEqual(request.full_url, 'https://www.okx.com/api/v5/public/mark-price?instType=SWAP')
+        self.assertFalse(any(name.lower().startswith('ok-access-') for name, _ in request.header_items()))
+
+    def test_full_swap_order_pages_and_unsupported_algo_families_are_refused(self):
+        for name, args in (('swap_pending_orders', ()), ('swap_pending_algos', ('oco',))):
+            with self.subTest(name=name), self.assertRaises(OkxError) as raised:
+                getattr(self.client(Transport(data=[{}] * 100)), name)(*args)
+            self.assertEqual(raised.exception.category, 'invalid_response')
+        transport = Transport(data=[])
+        with self.assertRaises(OkxError):
+            self.client(transport).swap_pending_algos('unsupported')
+        self.assertEqual(transport.requests, [])
+
 
 if __name__ == "__main__":
     unittest.main()

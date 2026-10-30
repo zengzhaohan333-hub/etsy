@@ -1,0 +1,34 @@
+[Unit]
+Description=OKX demo-only four-market trading controller
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=okxbot
+Group=okxbot
+WorkingDirectory=/opt/okxbot/app
+StateDirectory=okxbot
+StateDirectoryMode=0700
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+LoadCredential=api_key:/etc/okxbot/credentials/api_key
+LoadCredential=api_secret:/etc/okxbot/credentials/api_secret
+LoadCredential=api_passphrase:/etc/okxbot/credentials/api_passphrase
+ExecStart=/opt/okxbot/venv/bin/python -m okx_bot.service --config /etc/okxbot/config.portfolio.toml --state-dir /var/lib/okxbot --ack-demo-orders
+Restart=on-failure
+RestartPreventExitStatus=1 70 78
+RestartSec=30s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+# Account-wide lock files currently live in /tmp. Keep the shared namespace.
+PrivateTmp=false
+ReadWritePaths=/var/lib/okxbot /tmp
+
+[Install]
+WantedBy=multi-user.target

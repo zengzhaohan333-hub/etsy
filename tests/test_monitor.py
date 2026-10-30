@@ -1,6 +1,7 @@
 """Read-only monitoring checks. All files are local fixtures, no exchange access."""
 import io
 import json
+from contextlib import redirect_stdout
 from email.message import Message
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from okx_bot.monitor import DemoMonitor, PORTFOLIO_INSTRUMENTS, handler_for
+from okx_bot.monitor import DemoMonitor, PORTFOLIO_INSTRUMENTS, handler_for, main
 
 
 class MonitorTests(unittest.TestCase):
@@ -377,6 +378,94 @@ class MonitorTests(unittest.TestCase):
             {"status": "intent", "side": "long"}]}))
         result = self.monitor.snapshot(self.now)
         self.assertTrue(all(value["position"]["uncertain"] for value in result["markets"].values()))
+
+    def test_recovery_preserves_known_positions_but_never_freshens_account_curve(self):
+        self.portfolio()
+        bitcoin = self.state["markets"]["BTC-USDT-SWAP"]
+        bitcoin.update(position={"side": "long", "contracts": ".12", "entry_price": "70000"},
+                       phase="holding", protection_checked_at_ms=self.now)
+        self.state["equity_checked_at_ms"] = self.now
+        self.write()
+        initial = self.monitor.snapshot(self.now)
+        self.assertEqual(len(initial["equity_curve"]), 1)
+        later = self.now + 700_000
+        self.state.update(phase="recovering", updated_at_ms=later,
+                          connection={"state": "recovering", "attempt": 0, "max_attempts": 3},
+                          recovery={"round": 12, "delay_seconds": 60, "started_at_ms": self.now,
+                                    "elapsed_seconds": 0, "warning": False,
+                                    "last_error": {"category": "transport", "tls_failure": "unexpected_eof",
+                                                   "message": "test-secret", "exception": "test-key"}})
+        bitcoin["phase"] = "recovering"
+        self.write()
+        original = self.status.read_bytes()
+        result = self.monitor.snapshot(later)
+        self.assertEqual(result["health"], "recovering")
+        self.assertFalse(result["halted"])
+        self.assertFalse(result["stale"])
+        self.assertEqual(result["phase"], "recovering")
+        self.assertEqual(result["recovery"]["round"], 12)
+        self.assertEqual(result["recovery"]["elapsed_seconds"], 700)
+        self.assertTrue(result["recovery"]["warning"])
+        self.assertIn("TLS 连接被提前关闭", result["recovery"]["last_error_message"])
+        self.assertEqual(result["equity_curve"], initial["equity_curve"])
+        self.assertEqual(result["markets"]["BTC-USDT-SWAP"]["position"], initial["markets"]["BTC-USDT-SWAP"]["position"])
+        self.assertEqual(result["markets"]["BTC-USDT-SWAP"]["protection_checked_at_ms"], self.now)
+        self.assertNotIn("test-secret", json.dumps(result))
+        self.assertNotIn("test-key", json.dumps(result))
+        self.assertEqual(self.status.read_bytes(), original)
+        self.assertEqual(self.monitor.snapshot(later + 100_000)["health"], "stale")
+        self.state.update(halted=True, phase="halted")
+        self.write()
+        self.assertEqual(self.monitor.snapshot(later + 100_000)["health"], "halted")
+
+    def test_recovery_diagnostics_are_scalar_filtered_and_do_not_claim_trading_resumed(self):
+        self.portfolio()
+        self.state.update(phase="recovering", connection={"state": "recovering"},
+                          recovery={"round": True, "attempt": "test-key", "delay_seconds": 1,
+                                    "started_at_ms": "test-secret", "elapsed_seconds": -1, "warning": "true",
+                                    "last_error": {"category": "server", "api_code": "50001",
+                                                   "http_status": 503, "tls_failure": "certificate test-secret",
+                                                   "message": "test-secret", "headers": {"key": "test-key"}}})
+        self.state["markets"]["ETH-USDT-SWAP"]["protection_checked_at_ms"] = "test-key"
+        self.write()
+        result = self.monitor.snapshot(self.now)
+        recovery = result["recovery"]
+        self.assertNotIn("round", recovery)
+        self.assertNotIn("attempt", recovery)
+        self.assertNotIn("delay_seconds", recovery)
+        self.assertIsNone(recovery["started_at_ms"])
+        self.assertFalse(recovery["warning"])
+        self.assertEqual(recovery["last_error"], {"category": "server", "api_code": "50001", "http_status": 503})
+        self.assertIn("维护", recovery["last_error_message"])
+        self.assertNotIn("恢复正常", recovery["last_error_message"])
+        self.assertIsNone(result["markets"]["ETH-USDT-SWAP"]["protection_checked_at_ms"])
+        self.assertNotIn("test-secret", json.dumps(result))
+        self.assertNotIn("test-key", json.dumps(result))
+
+    def test_explicit_service_config_path_is_used_without_reading_status_selected_paths(self):
+        self.portfolio()
+        directory = self.root / "service-etc"
+        directory.mkdir()
+        custom = directory / "config.portfolio.toml"
+        custom.write_text('bar="5m"\nfast_window=5\nslow_window=20\nmax_notional="200"\nmax_total_notional="800"\nsecret="test-secret"\n')
+        (self.root / "config.portfolio.toml").write_text('bar="15m"\nmax_notional="999"\n')
+        self.state["config_file"] = str(self.root / "untrusted-secret-file")
+        self.write()
+        result = DemoMonitor(self.status, config_file=custom).snapshot(self.now)
+        self.assertEqual(result["profile"]["bar"], "5m")
+        self.assertEqual(result["profile"]["max_notional"], "200")
+        self.assertEqual(result["profile"]["max_total_notional"], "800")
+        self.assertNotIn("untrusted-secret-file", json.dumps(result))
+        self.assertNotIn("test-secret", json.dumps(result))
+
+    def test_cli_passes_explicit_local_service_config_path_to_monitor(self):
+        custom = self.root / "config.portfolio.toml"
+        with patch('okx_bot.monitor.DemoMonitor') as monitor_class, \
+             patch('okx_bot.monitor.handler_for', return_value=object()), \
+             patch('okx_bot.monitor.ThreadingHTTPServer') as server, redirect_stdout(io.StringIO()):
+            server.return_value.__enter__.return_value.serve_forever.side_effect = KeyboardInterrupt
+            self.assertEqual(main(['--status-file', str(self.status), '--config-file', str(custom)]), 0)
+            monitor_class.assert_called_once_with(self.status, config_file=custom)
 
     def test_local_page_nonce_and_read_only_routes(self):
         code, body, handler = self.request(path="/")

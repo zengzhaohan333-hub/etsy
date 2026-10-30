@@ -1,0 +1,26 @@
+[Unit]
+Description=Read-only local OKX demo status monitor
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=okxbot
+Group=okxbot
+WorkingDirectory=/opt/okxbot/app
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/okxbot/venv/bin/python -m okx_bot.monitor --status-file /var/lib/okxbot/status.json --config-file /etc/okxbot/config.portfolio.toml --port 8766
+Restart=on-failure
+RestartPreventExitStatus=1 70 78
+RestartSec=30s
+TimeoutStopSec=15s
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=false
+ReadOnlyPaths=/var/lib/okxbot /etc/okxbot
+
+[Install]
+WantedBy=multi-user.target
