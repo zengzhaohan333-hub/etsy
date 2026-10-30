@@ -156,6 +156,7 @@ try {
     [void] [IO.Directory]::CreateDirectory((Join-Path $project 'okx_bot'))
     [void] [IO.Directory]::CreateDirectory($binaryDirectory)
     [IO.File]::WriteAllText((Join-Path $project 'okx_bot\backtest.py'), '# Deliberately never executed by this test.')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\backtest-windows.ps1') -Destination (Join-Path $project 'backtest-windows.ps1')
     $launcher = Join-Path $project 'backtest-windows.bat'
     $sourceText = [IO.File]::ReadAllText($source).Replace("`r`n", "`n").Replace("`n", "`r`n")
     [IO.File]::WriteAllText($launcher, $sourceText, [Text.UTF8Encoding]::new($false))

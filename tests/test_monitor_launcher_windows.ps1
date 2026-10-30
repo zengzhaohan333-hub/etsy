@@ -49,6 +49,7 @@ try {
     [void] [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($oldState))
     [IO.File]::WriteAllText($oldState, '{"mode":"demo","fixture":true}')
     [IO.File]::WriteAllText((Join-Path $project 'okx_bot\monitor.py'), '# fixture')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\monitor-windows.ps1') -Destination (Join-Path $project 'monitor-windows.ps1')
     $env:OKX_MONITOR_STATUS_FILE = $oldState
     $env:OKX_MONITOR_TEST_CAPTURE = Join-Path $temporary 'capture.txt'
     $env:OKX_MONITOR_TEST_TRANSLATE = Join-Path $temporary 'translate.txt'
