@@ -213,6 +213,32 @@ class PortfolioTests(unittest.TestCase):
     def journal(self):
         return json.loads((self.state_dir / 'demo-journal.json').read_text())
 
+    def protected_eth_read_failure(self, *, fail_once):
+        """Complete ETH entry, then fail its protection GET next 5m cycle."""
+        class OnlyEth:
+            def __init__(self, fast, slow):
+                pass
+            def update(self, bar):
+                return 'long' if bar.close == D(10) else None
+        original_algos = self.client.pending_algo_orders
+        failures = []
+        snapshots = []
+        original_save = portfolio._save
+        def unavailable(inst_id):
+            if inst_id == MARKETS[1] and self.client.now > NOW and (not fail_once or not failures):
+                failures.append(inst_id)
+                raise OkxError('OKX rejected request (code 50001)', api_code='50001', category='api')
+            return original_algos(inst_id)
+        def save(path, contents):
+            original_save(path, contents)
+            if path.name == 'status.json':
+                snapshots.append(json.loads(json.dumps(contents)))
+        self.client.pending_algo_orders = unavailable
+        self.stop.on_wait = lambda seconds: setattr(self.client, 'now', self.client.now + INTERVAL) if seconds == .001 else None
+        with patch('okx_bot.portfolio.CrossStrategy', OnlyEth), patch('okx_bot.portfolio._save', side_effect=save):
+            result = self.run_bot(cycles=2)
+        return result, failures, snapshots, original_algos
+
     def test_four_markets_open_independently_with_shared_and_per_market_caps(self):
         result = self.run_bot()
         self.assertFalse(result['halted'], result)
@@ -379,6 +405,82 @@ class PortfolioTests(unittest.TestCase):
         self.assertEqual(len(self.client.place_calls), 1)
         self.assertTrue(self.client.position_rows[MARKETS[0]])
         self.assertEqual(self.client.place_calls[0]['side'], 'buy')
+
+    def test_protected_eth_50001_read_recovers_without_replaying_entry(self):
+        result, failures, snapshots, _original_algos = self.protected_eth_read_failure(fail_once=True)
+        self.assertFalse(result['halted'], result)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(result['entries'], 1)
+        self.assertEqual(len(self.client.place_calls), 1)
+        self.assertEqual(self.client.place_calls[0]['instrument'], MARKETS[1])
+        self.assertEqual(result['markets'][MARKETS[1]]['position']['side'], 'long')
+        self.assertTrue(result['markets'][MARKETS[1]]['position_known'])
+        self.assertTrue(self.client.position_rows[MARKETS[1]])
+        self.assertEqual(self.journal()['orders'][0]['status'], 'protected')
+        events = [state['connection']['state'] for state in snapshots]
+        retry = events.index('retrying')
+        checked = events.index('checking', retry + 1)
+        self.assertIn('connected', events[checked + 1:])
+        self.assertEqual(self.stop.waits.count(2), 1)
+        self.assertNotIn(4, self.stop.waits)
+
+    def test_protected_eth_50001_exhaustion_stops_without_replay_then_flat_terminal_reconciles(self):
+        result, failures, _snapshots, original_algos = self.protected_eth_read_failure(fail_once=False)
+        self.assertTrue(result['halted'])
+        self.assertEqual(result['halt_api_code'], '50001')
+        self.assertEqual(len(failures), 3)
+        self.assertEqual(result['entries'], 1)
+        self.assertEqual(len(self.client.place_calls), 1)
+        identity = self.client.place_calls[0]['client_id']
+        self.assertEqual(self.journal()['orders'][0]['client_id'], identity)
+        self.assertEqual(self.journal()['orders'][0]['status'], 'inspect_required')
+        self.assertTrue(self.client.position_rows[MARKETS[1]])
+        self.assertEqual(self.stop.waits.count(2), 1)
+        self.assertEqual(self.stop.waits.count(4), 1)
+
+        # The user verifies/clears every market at the exchange. This does not
+        # itself release the durable recovery block or cause an entry replay.
+        for inst in MARKETS:
+            self.client.position_rows[inst] = []
+            self.client.order_rows[inst] = []
+            self.client.algo_rows[inst] = []
+        self.client.pending_algo_orders = original_algos
+        leverage_before = len(self.client.leverage_calls)
+        restarted = self.run_bot()
+        self.assertTrue(restarted['halted'])
+        self.assertIn('journal', restarted['halt_reason'])
+        self.assertEqual(len(self.client.place_calls), 1)
+        self.assertEqual(len(self.client.leverage_calls), leverage_before)
+
+        self.client.calls.clear()
+        recovered = portfolio.reconcile_portfolio(config(), self.state_dir, client=self.client)
+        self.assertFalse(recovered['halted'], recovered)
+        self.assertTrue(recovered['reconciled'])
+        self.assertEqual(recovered['closed'], 1)
+        self.assertEqual(self.journal()['orders'][0]['status'], 'closed')
+        self.assertIn(('query_order', MARKETS[1]), self.client.calls)
+        for inst in MARKETS:
+            self.assertGreaterEqual(self.client.calls.count(('positions', inst)), 2)
+            self.assertGreaterEqual(self.client.calls.count(('pending_orders', inst)), 2)
+            self.assertGreaterEqual(self.client.calls.count(('pending_algo_orders', inst)), 2)
+        self.assertEqual(len(self.client.place_calls), 1)
+        self.assertEqual(len(self.client.leverage_calls), leverage_before)
+
+    def test_flat_after_protected_eth_read_halt_is_not_enough_if_order_remains_unknown(self):
+        _result, _failures, _snapshots, original_algos = self.protected_eth_read_failure(fail_once=False)
+        original = self.journal()
+        for inst in MARKETS:
+            self.client.position_rows[inst] = []
+            self.client.order_rows[inst] = []
+            self.client.algo_rows[inst] = []
+        self.client.pending_algo_orders = original_algos
+        identity = self.client.place_calls[0]['client_id']
+        self.client.orders[identity]['state'] = 'live'
+        recovered = portfolio.reconcile_portfolio(config(), self.state_dir, client=self.client)
+        self.assertTrue(recovered['halted'])
+        self.assertFalse(recovered['reconciled'])
+        self.assertEqual(self.journal(), original)
+        self.assertEqual(len(self.client.place_calls), 1)
 
     def test_cycle_end_refresh_checks_drawdown_after_fourth_fill_without_flattening(self):
         def fourth_fill(_instrument):

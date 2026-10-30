@@ -74,7 +74,7 @@ class RetryTests(unittest.TestCase):
     def test_transient_code_status_and_category_allowlist(self):
         cases = [dict(category=c) for c in ('timeout', 'dns', 'transport')]
         cases += [dict(category='http', http_status=s) for s in (408, 429, 500, 502, 503, 599)]
-        cases += [dict(category='api', api_code=c) for c in ('50011', '50004', '50013')]
+        cases += [dict(category='api', api_code=c) for c in ('50001', '50011', '50004', '50013')]
         for fields in cases:
             with self.subTest(fields=fields):
                 error = OkxError('safe error', **fields)
@@ -95,6 +95,10 @@ class RetryTests(unittest.TestCase):
             OkxError('safe', category='http', http_status=400),
             OkxError('safe', category='http', http_status=407),
             OkxError('safe', category='http', http_status=302),
+            OkxError('safe', category='tls', api_code='50001', http_status=503),
+            OkxError('safe', category='invalid_response', api_code='50001'),
+            OkxError('safe', category='transport', api_code='50001', http_status=401),
+            AmbiguousOrderError('unknown order', category='api', api_code='50001'),
             AmbiguousOrderError('unknown order', category='transport', http_status=503, api_code='50004'),
             OkxError('The message says timeout, but there is no typed diagnostic'),
         ]
@@ -169,7 +173,7 @@ class RetryTests(unittest.TestCase):
 
     def test_mutations_and_unlisted_methods_are_delegated_once(self):
         for name in ('set_leverage', 'place_market_order', 'cancel_order', 'unknown_method'):
-            for fields in (dict(category='transport'), dict(api_code='50004'), dict(http_status=503)):
+            for fields in (dict(category='transport'), dict(api_code='50001'), dict(api_code='50004'), dict(http_status=503)):
                 with self.subTest(name=name, fields=fields):
                     error = OkxError('mutation failed', **fields)
                     method = Mock(side_effect=error)
@@ -267,6 +271,67 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(self.stop.delays, [2])
         self.recovered.assert_called_once_with()
         self.assertNotIn('fake-secret', repr(self.events))
+
+    def test_typed_adapter_http200_maintenance_code_retries_get_then_recovers(self):
+        class Response(io.BytesIO):
+            status = 200
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            if len(calls) == 1:
+                return Response(b'{"code":"50001","data":[],"msg":"fake-key fake-secret fake-passphrase"}')
+            return Response(b'{"code":"0","data":[{"posMode":"net_mode","acctLv":"2"}]}')
+        self.client = OkxClient(Credentials('fake-key', 'fake-secret', 'fake-passphrase'), opener=opener)
+        wrapper = self.wrapper()
+        wrapper.begin_cycle(60)
+        self.assertEqual(wrapper.account_config()['posMode'], 'net_mode')
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(request.get_method() == 'GET' for request in calls))
+        self.assertIsNot(calls[0], calls[1])
+        self.assertEqual(self.stop.delays, [2])
+        self.assertEqual(self.events, [{'state': 'retrying', 'attempt': 2, 'max_attempts': 3,
+                                       'category': 'api', 'api_code': '50001', 'http_status': 200}])
+        self.recovered.assert_called_once_with()
+        self.assertNotIn('fake-', repr(self.events))
+
+    def test_typed_adapter_maintenance_read_stops_after_three_attempts(self):
+        class Response(io.BytesIO):
+            status = 200
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            return Response(b'{"code":"50001","msg":"fake-secret"}')
+        self.client = OkxClient(opener=opener)
+        wrapper = self.wrapper()
+        wrapper.begin_cycle(60)
+        with self.assertRaises(OkxError) as raised:
+            wrapper.server_time()
+        self.assertEqual(raised.exception.api_code, '50001')
+        self.assertEqual(raised.exception.http_status, 200)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.stop.delays, [2, 4])
+        self.assertEqual([event['attempt'] for event in self.events], [2, 3])
+        self.recovered.assert_not_called()
+        self.assertNotIn('fake-secret', str(raised.exception))
+
+    def test_typed_adapter_maintenance_post_is_never_resent(self):
+        class Response(io.BytesIO):
+            status = 200
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            return Response(b'{"code":"50001","data":[],"msg":"fake-secret"}')
+        self.client = OkxClient(Credentials('fake-key', 'fake-secret', 'fake-passphrase'), opener=opener)
+        with self.assertRaises(OkxError) as raised:
+            self.wrapper().place_market_order('ETH-USDT-SWAP', 'sell', '0.89', 'sameorderid',
+                                             stop_loss='225', take_profit='215')
+        self.assertEqual(raised.exception.api_code, '50001')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].get_method(), 'POST')
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.stop.delays, [])
+        self.recovered.assert_not_called()
+        self.assertNotIn('fake-secret', str(raised.exception))
 
     def test_typed_adapter_certificate_and_unknown_handshake_stop_after_one_read(self):
         for failure, expected in ((ssl.SSLCertVerificationError(1, 'fake-secret'), 'certificate'),

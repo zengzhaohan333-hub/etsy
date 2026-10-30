@@ -23,7 +23,9 @@ _CATEGORIES = frozenset({
     "local", "api", "http", "redirect", "proxy", "rate_limit", "server",
     "timeout", "tls", "dns", "transport", "invalid_response", "credential_format",
 })
-_TRANSIENT_API_CODES = frozenset({"50011", "50004", "50013"})
+# CCXT's upstream OKX error mapping classifies 50001 as OnMaintenance.
+# This permits bounded idempotent reads only; mutations remain delegated once.
+_TRANSIENT_API_CODES = frozenset({"50001", "50011", "50004", "50013"})
 _DENIED_CATEGORIES = frozenset({"tls", "invalid_response", "credential_format"})
 _TLS_FAILURES = frozenset({"certificate", "unexpected_eof", "handshake"})
 

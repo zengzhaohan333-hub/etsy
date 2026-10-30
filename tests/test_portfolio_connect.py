@@ -132,6 +132,24 @@ class PortfolioConnectTests(unittest.TestCase):
         runner.assert_not_called()
         confirm.assert_not_called()
 
+    def test_unresolved_journal_refusal_names_the_safe_recovery_entry(self):
+        result = {"halted": True, "halt_reason":
+            "Unresolved or invalid demo journal; manually reconcile exchange positions, orders and algos before recovery"}
+        code, _, errors, runner, _, _ = self.invoke_wizard(answer="DEMO", result=result)
+        self.assertEqual(code, 1)
+        runner.assert_called_once()
+        self.assertIn("reconcile-okx-portfolio.bat", errors)
+        self.assertIn("保留原日志", errors)
+
+    def test_execution_service_error_explains_code_without_echoing_halt_reason(self):
+        result = {"halted": True, "halt_reason": "example-secret", "halt_api_code": "50001",
+                  "halt_category": "api", "halt_http_status": 200}
+        code, output, errors, _, _, _ = self.invoke_wizard(answer="DEMO", result=result)
+        self.assertEqual(code, 1)
+        self.assertIn("50001", errors)
+        self.assertIn("维护", errors)
+        self.assertNotIn("example-secret", output + errors)
+
     def test_reconciliation_never_runs_trading_or_asks_for_demo_confirmation(self):
         for halted in (False, True):
             with self.subTest(halted=halted), patch("okx_bot.portfolio.reconcile_portfolio",

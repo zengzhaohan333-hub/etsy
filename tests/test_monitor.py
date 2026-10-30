@@ -29,6 +29,14 @@ class MonitorTests(unittest.TestCase):
     def write(self):
         self.status.write_text(json.dumps(self.state), encoding="utf-8")
 
+    def test_service_maintenance_halt_has_safe_explanation(self):
+        self.state.update(halted=True, halt_api_code="50001", halt_reason="test-secret")
+        self.write()
+        report = self.monitor.snapshot(self.now)
+        self.assertEqual(report["health"], "halted")
+        self.assertIn("维护", report["halt_message"])
+        self.assertNotIn("test-secret", json.dumps(report))
+
     def request(self, method="GET", path="/api/status", headers=None, report=None):
         cls = handler_for(self.monitor, report)
         handler = cls.__new__(cls)

@@ -222,6 +222,7 @@ def _print_api_error(error: OkxError) -> None:
         elif code == "50110":
             print("欧易本次响应未提供可识别的来源 IP，程序没有猜测地址。", file=sys.stderr)
         hints = {
+            "50001": "欧易服务处于维护或暂不可用状态，请稍后重新进行连接检查。",
             "50101": "请确认使用的是在欧易【模拟交易】中创建的 API。",
             "50102": "请检查 Windows 和 WSL 时间是否已同步。",
             "50105": "请核对创建这组 API 时设置的 Passphrase；它不是欧易登录密码。",
@@ -319,6 +320,21 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 result = run_demo(config, args.state_dir, stop, client=client)
         if result.get("halted"):
+            reason = result.get("halt_reason")
+            if reason == "Unresolved or invalid demo journal; manually reconcile exchange positions, orders and algos before recovery":
+                if args.portfolio:
+                    print("本地订单日志尚未通过恢复核对。确认欧易四币均空仓且无挂单后，"
+                          "请在保留原日志的同一文件夹运行 reconcile-okx-portfolio.bat；核对成功后再启动。", file=sys.stderr)
+                else:
+                    print("本地订单日志尚未通过恢复核对；请保留日志，核对交易所状态后再恢复。", file=sys.stderr)
+            elif reason == "Another demo process owns this API key or state directory":
+                print("同一 API 或状态目录已有机器人运行，请检查原窗口，避免重复启动。", file=sys.stderr)
+            code = result.get("halt_api_code")
+            if type(code) is str and re.fullmatch(r"[0-9]{1,12}", code):
+                _print_api_error(OkxError("Demo execution halted", api_code=code,
+                    http_status=result.get("halt_http_status"),
+                    category=result.get("halt_category") if type(result.get("halt_category")) is str else "local",
+                    tls_failure=result.get("halt_tls_failure")))
             print("模拟交易程序已停止或启动被拒绝。请查看本机状态目录中的 status.json，"
                   "并核对欧易模拟盘持仓、挂单和止盈止损单；不要直接删除恢复日志。", file=sys.stderr)
             return 1

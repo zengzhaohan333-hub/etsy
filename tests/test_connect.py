@@ -255,6 +255,13 @@ class ConnectTests(unittest.TestCase):
         self.runner.assert_not_called()
         self.assert_no_secrets_printed()
 
+    def test_service_maintenance_code_gets_relevant_hint_without_remote_message(self):
+        error = OkxError(ENV["OKX_API_SECRET"], api_code="50001", category="api")
+        connect._print_api_error(error)
+        self.assertIn("50001", self.stderr.getvalue())
+        self.assertIn("维护", self.stderr.getvalue())
+        self.assert_no_secrets_printed()
+
     def test_numeric_code_with_unexpected_extra_data_is_not_echoed(self):
         self.client.account_config = Mock(side_effect=OkxError('OKX rejected request (code 50101) ' + ENV['OKX_API_SECRET']))
         self.assertEqual(self.invoke(), 1)
