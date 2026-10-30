@@ -25,9 +25,10 @@ _CATEGORIES = frozenset({
 })
 _TRANSIENT_API_CODES = frozenset({"50011", "50004", "50013"})
 _DENIED_CATEGORIES = frozenset({"tls", "invalid_response", "credential_format"})
+_TLS_FAILURES = frozenset({"certificate", "unexpected_eof", "handshake"})
 
 
-def _diagnostics(error: OkxError) -> tuple[str, str | None, int | None, bool]:
+def _diagnostics(error: OkxError) -> tuple[str, str | None, int | None, str | None, bool]:
     """Validate safe scalars; never inspect or expose an error's raw message."""
     raw_category = getattr(error, "category", None)
     category_valid = type(raw_category) is str and raw_category in _CATEGORIES
@@ -38,15 +39,22 @@ def _diagnostics(error: OkxError) -> tuple[str, str | None, int | None, bool]:
         code = None
     raw_status = getattr(error, "http_status", None)
     status = raw_status if type(raw_status) is int and 100 <= raw_status <= 599 else None
+    raw_tls = getattr(error, "tls_failure", None)
+    tls_failure = raw_tls if type(raw_tls) is str and raw_tls in _TLS_FAILURES else None
+    # A TLS subtype cannot override a contradictory category supplied by a
+    # custom client. Only typed unexpected EOF is a retriable TLS disconnect.
+    tls_valid = (raw_tls is None or (tls_failure == "unexpected_eof" and category == "transport")
+                 or (tls_failure in {"certificate", "handshake"} and category == "tls"))
     fields_valid = (category_valid and (raw_code is None or code is not None)
-                    and (raw_status is None or status is not None))
-    return category, code, status, fields_valid
+                    and (raw_status is None or status is not None) and tls_valid)
+    return category, code, status, tls_failure, fields_valid
 
 
 def _retryable(error: OkxError) -> bool:
-    category, code, status, fields_valid = _diagnostics(error)
+    category, code, status, tls_failure, fields_valid = _diagnostics(error)
     if (not fields_valid or isinstance(error, AmbiguousOrderError)
-            or category in _DENIED_CATEGORIES or status in (401, 403)):
+            or category in _DENIED_CATEGORIES or status in (401, 403)
+            or tls_failure in {"certificate", "handshake"}):
         return False
     # A known non-transient business code takes precedence over a transport or
     # 5xx label. In particular all 501xx authentication errors fail immediately.
@@ -119,12 +127,14 @@ class ReadRetryClient:
                     if (attempt >= self._max_attempts or not _retryable(error)
                             or self._stop.is_set()):
                         raise
-                    category, code, status, _valid = _diagnostics(error)
+                    category, code, status, tls_failure, _valid = _diagnostics(error)
                     if self._on_retry is not None:
-                        self._on_retry({"state": "retrying", "attempt": attempt + 1,
-                                        "max_attempts": self._max_attempts,
-                                        "category": category, "api_code": code,
-                                        "http_status": status})
+                        event = {"state": "retrying", "attempt": attempt + 1,
+                                 "max_attempts": self._max_attempts,
+                                 "category": category, "api_code": code, "http_status": status}
+                        if tls_failure is not None:
+                            event["tls_failure"] = tls_failure
+                        self._on_retry(event)
                     self._check_budget()
                     if self._stop.is_set():
                         raise

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import CrossStrategy, position_size, protection_prices
-from .okx import Credentials, OkxClient, OkxError
+from .okx import Credentials, OkxClient, OkxError, _safe_tls_failure
 from .read_retry import ReadRetryClient, is_retryable_read_error
 
 
@@ -417,6 +417,12 @@ def run_demo(config: Any, state_dir: Path, stop: threading.Event, poll_seconds: 
             report["halt_category"] = error.category
             report["halt_api_code"] = error.api_code
             report["halt_http_status"] = error.http_status
+            # Retain only a category-compatible, fixed TLS subtype. This lets
+            # the monitor distinguish a broken connection from a failed
+            # certificate without exposing transport messages or proxy URLs.
+            tls_failure = _safe_tls_failure(getattr(error, "tls_failure", None), error.category)
+            if tls_failure is not None:
+                report["halt_tls_failure"] = tls_failure
         report["connection"] = {"state": "failed", "attempt": 0, "max_attempts": 3}
         report["halt_reason"] = str(error) if isinstance(error, (DemoHalt, OkxError)) else "Demo controller error; inspect journal and exchange state before restarting"
         if entry is not None and journal is not None and journal_path is not None:

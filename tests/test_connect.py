@@ -334,6 +334,29 @@ class ConnectTests(unittest.TestCase):
         self.assertNotIn('50110', self.stderr.getvalue())
         self.assert_no_secrets_printed()
 
+    def test_tls_failure_hints_distinguish_certificate_handshake_and_eof(self):
+        for category, subtype, expected in (("tls", "certificate", "证书验证失败"),
+                                            ("tls", "handshake", "TLS 握手失败"),
+                                            ("transport", "unexpected_eof", "TLS 连接被提前关闭")):
+            with self.subTest(subtype=subtype):
+                self.stderr.seek(0)
+                self.stderr.truncate()
+                error = OkxError(ENV["OKX_API_SECRET"], category=category, tls_failure=subtype)
+                connect._print_api_error(error)
+                self.assertIn(expected, self.stderr.getvalue())
+                self.assert_no_secrets_printed()
+
+    def test_untrusted_tls_failure_is_never_printed_or_used_as_a_hint(self):
+        for value in (ENV["OKX_API_SECRET"], [ENV["OKX_API_SECRET"]], "certificate"):
+            with self.subTest(value=value):
+                self.stderr.seek(0)
+                self.stderr.truncate()
+                error = OkxError(ENV["OKX_API_SECRET"], category="transport")
+                error.tls_failure = value
+                connect._print_api_error(error)
+                self.assertNotIn("证书验证失败", self.stderr.getvalue())
+                self.assert_no_secrets_printed()
+
     def test_public_timeout_is_reported_before_any_private_request(self):
         error = OkxError(ENV['OKX_API_SECRET'])
         error.category = 'timeout'

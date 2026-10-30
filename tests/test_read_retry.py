@@ -1,10 +1,12 @@
 import contextlib
 import io
+import ssl
 import unittest
+import urllib.error
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
-from okx_bot.okx import AmbiguousOrderError, OkxError
+from okx_bot.okx import AmbiguousOrderError, Credentials, OkxClient, OkxError
 from okx_bot.read_retry import ReadRetryClient
 
 
@@ -200,6 +202,105 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(self.events, [{'state': 'retrying', 'attempt': 2, 'max_attempts': 3,
                                        'category': 'server', 'api_code': '50013', 'http_status': 503}])
         self.assertNotIn('fake-', repr(self.events))
+
+    def test_validated_tls_eof_is_propagated_in_safe_retry_metadata(self):
+        error = OkxError('fake-key fake-secret fake-passphrase', category='transport')
+        error.tls_failure = 'unexpected_eof'
+        self.client.server_time = Mock(side_effect=[error, 123])
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.wrapper().server_time(), 123)
+        self.assertEqual(out.getvalue() + err.getvalue(), '')
+        self.assertEqual(self.events, [{'state': 'retrying', 'attempt': 2, 'max_attempts': 3,
+                                       'category': 'transport', 'api_code': None, 'http_status': None,
+                                       'tls_failure': 'unexpected_eof'}])
+        self.assertNotIn('fake-', repr(self.events))
+
+    def test_certificate_and_handshake_cannot_bypass_deny_with_transport_category(self):
+        for category in ('transport', 'tls', 'timeout'):
+            for tls_failure in ('certificate', 'handshake'):
+                with self.subTest(category=category, tls_failure=tls_failure):
+                    error = OkxError('fake-secret', category=category, api_code='50013', http_status=503)
+                    error.tls_failure = tls_failure
+                    self.client.balances = Mock(side_effect=error)
+                    with self.assertRaises(OkxError) as raised:
+                        self.wrapper().balances()
+                    self.assertIs(raised.exception, error)
+                    self.assertEqual(self.client.balances.call_count, 1)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.stop.delays, [])
+
+    def test_invalid_or_inconsistent_tls_metadata_is_never_retried(self):
+        for category, tls_failure in (('transport', 'unexpected_eof fake-secret'),
+                                     ('transport', ['unexpected_eof']), ('transport', 1),
+                                     ('tls', 'unexpected_eof'), ('dns', 'unexpected_eof')):
+            with self.subTest(category=category, tls_failure=tls_failure):
+                error = OkxError('fake-secret', category=category)
+                error.tls_failure = tls_failure
+                self.client.balances = Mock(side_effect=error)
+                with self.assertRaises(OkxError):
+                    self.wrapper().balances()
+                self.assertEqual(self.client.balances.call_count, 1)
+        self.assertEqual(self.events, [])
+
+    def test_ambiguous_tls_eof_is_never_retried_even_on_allowlisted_read(self):
+        error = AmbiguousOrderError('safe unknown order result', category='transport')
+        error.tls_failure = 'unexpected_eof'
+        self.client.query_order = Mock(side_effect=error)
+        with self.assertRaises(AmbiguousOrderError) as raised:
+            self.wrapper().query_order('BTC-USDT-SWAP', 'same-order-id')
+        self.assertIs(raised.exception, error)
+        self.assertEqual(self.client.query_order.call_count, 1)
+        self.assertEqual(self.events, [])
+
+    def test_typed_adapter_tls_eof_retries_read_and_recovers(self):
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            if len(calls) == 1:
+                raise urllib.error.URLError(ssl.SSLEOFError(ssl.SSL_ERROR_EOF, 'fake-secret'))
+            return io.BytesIO(b'{"code":"0","data":[{"ts":"123"}]}')
+        self.client = OkxClient(opener=opener)
+        self.assertEqual(self.wrapper().server_time(), 123)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.events[0]['category'], 'transport')
+        self.assertEqual(self.events[0]['tls_failure'], 'unexpected_eof')
+        self.assertEqual(self.stop.delays, [2])
+        self.recovered.assert_called_once_with()
+        self.assertNotIn('fake-secret', repr(self.events))
+
+    def test_typed_adapter_certificate_and_unknown_handshake_stop_after_one_read(self):
+        for failure, expected in ((ssl.SSLCertVerificationError(1, 'fake-secret'), 'certificate'),
+                                  (ssl.SSLError(1, 'fake-secret'), 'handshake')):
+            with self.subTest(expected=expected):
+                calls = []
+                def opener(request, timeout):
+                    calls.append(request)
+                    raise urllib.error.URLError(failure)
+                self.client = OkxClient(opener=opener)
+                with self.assertRaises(OkxError) as raised:
+                    self.wrapper().server_time()
+                self.assertEqual(raised.exception.category, 'tls')
+                self.assertEqual(raised.exception.tls_failure, expected)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn('fake-secret', str(raised.exception))
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.stop.delays, [])
+
+    def test_typed_adapter_order_tls_eof_stays_ambiguous_without_resubmit(self):
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            raise ssl.SSLEOFError(ssl.SSL_ERROR_EOF, 'fake-secret')
+        self.client = OkxClient(Credentials('fake-key', 'fake-secret', 'fake-passphrase'), opener=opener)
+        with self.assertRaises(AmbiguousOrderError) as raised:
+            self.wrapper().place_market_order('BTC-USDT-SWAP', 'buy', '1', 'sameorderid',
+                                             stop_loss='90', take_profit='110')
+        self.assertEqual(raised.exception.category, 'transport')
+        self.assertEqual(raised.exception.tls_failure, 'unexpected_eof')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.stop.delays, [])
+        self.assertNotIn('fake-secret', str(raised.exception))
 
     def test_callbacks_order_retry_before_wait_recovered_before_return(self):
         order = []

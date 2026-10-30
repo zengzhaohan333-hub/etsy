@@ -163,6 +163,66 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn("test-secret", json.dumps(result))
         self.assertNotIn("test-key", json.dumps(result))
 
+    def test_tls_halt_subtypes_have_distinct_safe_messages(self):
+        cases = (
+            ("tls", "certificate", ("证书验证失败", "系统时间", "证书链", "保留证书校验")),
+            ("tls", "handshake", ("TLS 握手失败", "代理连接", "保留证书校验")),
+            ("transport", "unexpected_eof", ("TLS 连接被提前关闭", "有限读取重试", "代理稳定性")),
+        )
+        for category, subtype, expected in cases:
+            with self.subTest(category=category, subtype=subtype):
+                self.state.update(halted=True, halt_category=category, halt_tls_failure=subtype,
+                                  halt_reason="test-secret TLS raw exception test-key")
+                self.write()
+                result = self.monitor.snapshot(self.now)
+                for text in expected:
+                    self.assertIn(text, result["halt_message"])
+                self.assertNotIn("test-secret", json.dumps(result))
+                self.assertNotIn("test-key", json.dumps(result))
+                if subtype == "unexpected_eof":
+                    self.assertNotIn("证书验证失败", result["halt_message"])
+
+    def test_tls_unknown_or_mismatched_subtype_does_not_invent_a_diagnosis(self):
+        cases = (("tls", "unexpected_eof"), ("transport", "certificate"), ("timeout", "handshake"),
+                 ("tls", "certificate test-secret"), ("tls", None), ("tls", ["certificate"]),
+                 ("tls", {"message": "test-secret"}))
+        for category, subtype in cases:
+            with self.subTest(category=category, subtype=subtype):
+                self.state.update(halted=True, halt_category=category, halt_tls_failure=subtype,
+                                  halt_reason="test-key")
+                self.write()
+                result = self.monitor.snapshot(self.now)
+                self.assertNotIn("TLS 连接被提前关闭", result["halt_message"])
+                self.assertNotIn("证书验证失败", result["halt_message"])
+                if category == "tls":
+                    self.assertIn("证书校验或握手失败", result["halt_message"])
+                self.assertNotIn("test-secret", json.dumps(result))
+                self.assertNotIn("test-key", json.dumps(result))
+
+    def test_connection_only_exposes_valid_tls_diagnostic_scalars(self):
+        self.state["connection"] = {"state": "retrying", "attempt": 1, "max_attempts": 3,
+                                    "category": "transport", "tls_failure": "unexpected_eof",
+                                    "api_code": "50013", "http_status": 503,
+                                    "message": "test-secret", "exception": "test-key"}
+        self.write()
+        result = self.monitor.snapshot(self.now)
+        self.assertEqual(result["connection"], {"state": "retrying", "attempt": 1, "max_attempts": 3,
+                                               "category": "transport", "tls_failure": "unexpected_eof",
+                                               "api_code": "50013", "http_status": 503})
+        self.assertNotIn("test-secret", json.dumps(result))
+        self.assertNotIn("test-key", json.dumps(result))
+        for category, subtype in (("tls", "unexpected_eof"), ("transport", "certificate"),
+                                  ("tls test-secret", "certificate")):
+            with self.subTest(category=category, subtype=subtype):
+                self.state["connection"].update(category=category, tls_failure=subtype,
+                                                api_code="50013 test-secret", http_status="503")
+                self.write()
+                clean = self.monitor.snapshot(self.now)["connection"]
+                self.assertNotIn("tls_failure", clean)
+                self.assertNotIn("api_code", clean)
+                self.assertNotIn("http_status", clean)
+                self.assertNotIn("test-secret", json.dumps(clean))
+
     def test_user_stopped_state_is_distinct_from_halt_and_stale_health(self):
         self.state.update(phase="stopped", connection={"state": "connected", "attempt": 0, "max_attempts": 3})
         self.write()

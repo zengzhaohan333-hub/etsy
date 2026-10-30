@@ -34,7 +34,7 @@ class OkxError(RuntimeError):
 
     def __init__(self, message: str, *, api_code: Any = None,
                  http_status: Any = None, category: str = "local",
-                 request_ip: Any = None) -> None:
+                 request_ip: Any = None, tls_failure: Any = None) -> None:
         super().__init__(message)
         # Only safe scalars are attached. Never retain a response, URL, headers,
         # body, remote message or original transport exception for diagnostics.
@@ -42,6 +42,8 @@ class OkxError(RuntimeError):
         self.http_status = _safe_http_status(http_status)
         self.category = category if isinstance(category, str) and category in self._CATEGORIES else "local"
         self.request_ip = _safe_request_ip(request_ip) if self.api_code == "50110" else None
+        self.tls_failure = tls_failure if type(tls_failure) is str and tls_failure in {
+            "certificate", "unexpected_eof", "handshake"} else None
 
 
 class AmbiguousOrderError(OkxError):
@@ -57,6 +59,21 @@ def _safe_api_code(value: Any) -> str | None:
 
 def _safe_http_status(value: Any) -> int | None:
     return value if type(value) is int and 100 <= value <= 599 else None
+
+
+def _safe_tls_failure(value: Any, category: Any) -> str | None:
+    """Revalidate both safe scalar value and category at a reporting boundary.
+
+    Retry callers must reject a non-null raw field when this returns None;
+    silently dropping an inconsistent certificate marker could permit retries.
+    """
+    if type(value) is not str or type(category) is not str:
+        return None
+    if category == "transport" and value == "unexpected_eof":
+        return value
+    if category == "tls" and value in {"certificate", "handshake"}:
+        return value
+    return None
 
 
 def _safe_request_ip(value: Any) -> str | None:
@@ -132,17 +149,29 @@ def _http_failure(status: Any, raw: Any, *, order: bool) -> OkxError:
                     request_ip=request_ip)
 
 
-def _transport_category(error: BaseException) -> str:
+def _transport_diagnostics(error: BaseException) -> tuple[str, str | None]:
     # A URLError can wrap a typed socket exception or merely a string. Only
-    # inspect types; a reason string can contain proxy URLs and credentials.
+    # unwrap once and inspect types. Never infer TLS failures from a reason
+    # string, which can contain proxy URLs, credentials or misleading wording.
     reason = error.reason if isinstance(error, urllib.error.URLError) else error
-    if isinstance(reason, (TimeoutError, socket.timeout)):
-        return "timeout"
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return "tls", "certificate"
+    if isinstance(reason, ssl.SSLEOFError):
+        # A typed unexpected EOF is a broken connection, not evidence that
+        # certificate validation failed. Only the caller's read-only retry
+        # wrapper may retry it; an order result remains ambiguous below.
+        return "transport", "unexpected_eof"
     if isinstance(reason, ssl.SSLError):
-        return "tls"
+        return "tls", "handshake"
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return "timeout", None
     if isinstance(reason, socket.gaierror):
-        return "dns"
-    return "transport"
+        return "dns", None
+    return "transport", None
+
+
+def _transport_category(error: BaseException) -> str:
+    return _transport_diagnostics(error)[0]
 
 
 @dataclass(frozen=True, repr=False)
@@ -289,23 +318,31 @@ class OkxClient:
             # 400/401 JSON code is not erased as a generic connection failure.
             status = _safe_http_status(error.code)
             error_raw = None
+            body_tls = None
             try:
                 error_raw = error.read(_MAX_ERROR_BYTES + 1)
-            except (OSError, http.client.HTTPException, ValueError, TypeError):
-                pass
+            except (OSError, http.client.HTTPException, ValueError, TypeError) as body_error:
+                body_category, body_failure = _transport_diagnostics(body_error)
+                if body_failure is not None:
+                    body_tls = (body_category, body_failure)
             finally:
                 try:
                     error.close()
                 except (OSError, ValueError):
                     pass
-            raise _http_failure(status, error_raw, order=order) from None
+            failure = _http_failure(status, error_raw, order=order)
+            if body_tls is not None:
+                # A known HTTP status remains useful, but cannot make a typed
+                # certificate/handshake failure eligible for a GET retry.
+                failure.category, failure.tls_failure = body_tls
+            raise failure from None
         except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError, TimeoutError) as error:
-            category = _transport_category(error)
+            category, tls_failure = _transport_diagnostics(error)
             if order:
                 raise AmbiguousOrderError("Order response unavailable; reconcile using client order ID before continuing",
-                                          category=category) from None
+                                          category=category, tls_failure=tls_failure) from None
             raise OkxError("OKX HTTPS request failed; check network, time and demo credentials",
-                           category=category) from None
+                           category=category, tls_failure=tls_failure) from None
         if response_status is not None and not 200 <= response_status < 300:
             raise _http_failure(response_status, raw, order=order)
         try:

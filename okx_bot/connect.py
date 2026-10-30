@@ -23,7 +23,7 @@ from typing import Any, Callable
 
 from .config import Config, load_config
 from .demo import run_demo
-from .okx import Credentials, OkxClient, OkxError
+from .okx import Credentials, OkxClient, OkxError, _safe_tls_failure
 from .read_retry import ReadRetryClient
 
 
@@ -202,6 +202,14 @@ def _print_api_error(error: OkxError) -> None:
         category = getattr(error, "category", None)
         fallback = "请检查当前代理连接和欧易公共接口访问；当前信息不足以判断密钥、权限或白名单是否正确。"
         hint = hints.get(category, fallback) if isinstance(category, str) else fallback
+        tls_failure = _safe_tls_failure(getattr(error, "tls_failure", None), category)
+        tls_hints = {
+            "certificate": "HTTPS 证书验证失败。请核对系统时间和证书链，保留证书校验。",
+            "unexpected_eof": "TLS 连接被提前关闭，有限读取重试后仍未恢复。请检查当前代理连接的稳定性。",
+            "handshake": "TLS 握手失败。请检查当前代理连接；这不表示已确认是证书问题。",
+        }
+        if tls_failure is not None:
+            hint = tls_hints[tls_failure]
     print(hint, file=sys.stderr)
 
 

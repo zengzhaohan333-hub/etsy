@@ -8,7 +8,7 @@ import uuid
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from okx_bot import demo
 from okx_bot.config import Config
@@ -244,6 +244,34 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(self.client.leverage_calls, 1)
         self.assertEqual(self.client.place_calls, 0)
         self.assertEqual(stop.waits, [])
+
+    def test_tls_halts_preserve_safe_subtype_and_read_retry_limit(self):
+        for category, subtype, attempts in (("tls", "certificate", 1),
+                                             ("tls", "handshake", 1),
+                                             ("transport", "unexpected_eof", 3)):
+            with self.subTest(subtype=subtype):
+                error = OkxError("Static TLS failure", category=category, tls_failure=subtype)
+                self.client.balances = Mock(side_effect=error)
+                stop = NoSleepStop()
+                result, snapshots = self.run_with_statuses(stop=stop)
+                self.assertTrue(result["halted"])
+                self.assertEqual(result["halt_tls_failure"], subtype)
+                self.assertEqual(result["halt_category"], category)
+                self.assertEqual(self.client.balances.call_count, attempts)
+                self.assertEqual(stop.waits, [2, 4] if attempts == 3 else [])
+                self.assertEqual(snapshots[-1]["halt_tls_failure"], subtype)
+                self.assertEqual(self.client.place_calls, 0)
+
+    def test_halt_status_omits_inconsistent_or_untrusted_tls_subtype(self):
+        for value in ("certificate", "secret-proxy-url", ["secret-proxy-url"]):
+            with self.subTest(value=value):
+                error = OkxError("Static read failure", category="transport")
+                error.tls_failure = value
+                self.client.balances = Mock(side_effect=error)
+                result = self.run_bot(stop=NoSleepStop())
+                self.assertTrue(result["halted"])
+                self.assertNotIn("halt_tls_failure", result)
+                self.assertEqual(self.client.balances.call_count, 1)
 
     def test_ambiguous_order_write_with_transient_category_never_retries(self):
         def failed_write(*_args, **_kwargs):

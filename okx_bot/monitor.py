@@ -21,6 +21,9 @@ import tomllib
 
 MAX_BYTES = 4 * 1024 * 1024
 MAX_AGE_MS = 90_000
+_CONNECTION_CATEGORIES = frozenset({"local", "api", "http", "redirect", "proxy", "rate_limit",
+                                    "server", "timeout", "tls", "dns", "transport", "invalid_response",
+                                    "credential_format"})
 
 
 def _number(value):
@@ -40,13 +43,34 @@ def _timestamp(value):
     return value if type(value) is int and 0 <= value <= 32_503_680_000_000 else None
 
 
+def _tls_failure(category, value):
+    """Only accept a known TLS subtype paired with its safe parent category."""
+    if type(category) is not str or type(value) is not str:
+        return None
+    allowed = {"tls": {"certificate", "handshake"}, "transport": {"unexpected_eof"}}
+    return value if value in allowed.get(category, set()) else None
+
+
 def _connection(value):
-    if not isinstance(value, dict) or value.get("state") not in {"checking", "connected", "retrying", "failed", "blocked"}:
+    if (not isinstance(value, dict) or type(value.get("state")) is not str
+            or value["state"] not in {"checking", "connected", "retrying", "failed", "blocked"}):
         return None
     result = {"state": value["state"]}
     for field in ("attempt", "max_attempts"):
         if type(value.get(field)) is int and 0 <= value[field] <= 3:
             result[field] = value[field]
+    category = value.get("category")
+    if type(category) is str and category in _CONNECTION_CATEGORIES:
+        result["category"] = category
+        subtype = _tls_failure(category, value.get("tls_failure"))
+        if subtype is not None:
+            result["tls_failure"] = subtype
+    api_code = value.get("api_code")
+    if type(api_code) in (str, int) and re.fullmatch(r"[0-9]{1,12}", str(api_code)):
+        result["api_code"] = str(api_code)
+    http_status = value.get("http_status")
+    if type(http_status) is int and 100 <= http_status <= 599:
+        result["http_status"] = http_status
     return result
 
 
@@ -62,6 +86,14 @@ def _halt_message(state):
                     "50013": "欧易服务暂时不可用，读取重试仍未成功。"}
         return meanings.get(code, f"欧易返回 API 错误代码 {code}。")
     category = state.get("halt_category")
+    subtype = _tls_failure(category, state.get("halt_tls_failure"))
+    tls_meanings = {
+        "certificate": "HTTPS 证书验证失败；请检查电脑系统时间及证书链，保留证书校验。",
+        "handshake": "TLS 握手失败；请检查代理连接和网络，保留证书校验。",
+        "unexpected_eof": "TLS 连接被提前关闭，有限读取重试后已停止；请检查代理稳定性。订单结果未知时不会重发。",
+    }
+    if subtype is not None:
+        return tls_meanings[subtype]
     meanings = {"timeout": "读取欧易数据持续超时，请检查代理和网络。",
                 "dns": "域名解析失败，请检查代理和网络。",
                 "transport": "读取欧易数据时连接失败，请检查代理和网络。",

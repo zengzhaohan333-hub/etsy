@@ -223,7 +223,7 @@ class OkxTests(unittest.TestCase):
         displayed = str(error) + repr(error) + repr(error.__dict__)
         for sensitive in ("test-key", "test-secret", "test-passphrase"):
             self.assertNotIn(sensitive, displayed)
-        self.assertEqual(set(error.__dict__), {"api_code", "http_status", "category", "request_ip"})
+        self.assertEqual(set(error.__dict__), {"api_code", "http_status", "category", "request_ip", "tls_failure"})
 
     def test_http_authentication_error_preserves_only_numeric_code_and_status(self):
         for status in (400, 401):
@@ -380,6 +380,138 @@ class OkxTests(unittest.TestCase):
                 self.assertEqual(raised.exception.category, category)
                 self.assertIsNone(raised.exception.api_code)
                 self.assertIsNone(raised.exception.http_status)
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_typed_tls_subtypes_are_safe_and_unwrapped_once(self):
+        cases = [
+            (ssl.SSLEOFError(8, "test-secret"), "transport", "unexpected_eof"),
+            (urllib.error.URLError(ssl.SSLEOFError(8, "test-passphrase")), "transport", "unexpected_eof"),
+            (ssl.SSLCertVerificationError(1, "test-secret"), "tls", "certificate"),
+            (urllib.error.URLError(ssl.SSLCertVerificationError(1, "test-key")), "tls", "certificate"),
+            (ssl.SSLError(1, "test-secret"), "tls", "handshake"),
+            (urllib.error.URLError(ssl.SSLError(1, "EOF test-passphrase")), "tls", "handshake"),
+            (urllib.error.URLError("SSLEOFError test-secret"), "transport", None),
+            (urllib.error.URLError(urllib.error.URLError(ssl.SSLCertVerificationError(1, "test-key"))), "transport", None),
+        ]
+        for failure, category, tls_failure in cases:
+            with self.subTest(kind=type(failure).__name__, category=category, tls_failure=tls_failure):
+                transport = Transport(failure=failure)
+                with self.assertRaises(OkxError) as raised:
+                    self.client(transport).account_config()
+                self.assertEqual(raised.exception.category, category)
+                self.assertEqual(raised.exception.tls_failure, tls_failure)
+                self.assertEqual(len(transport.requests), 1)
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_error_constructor_only_retains_known_tls_failure_enum(self):
+        for value in ("certificate", "unexpected_eof", "handshake"):
+            error = OkxError("Controlled message", tls_failure=value)
+            self.assertEqual(error.tls_failure, value)
+            self.assert_safe_diagnostic(error)
+        for value in (None, "test-secret", "handshake test-passphrase", "certificate\n", True, 1, [], {}):
+            with self.subTest(value=type(value).__name__):
+                error = OkxError("Controlled message", tls_failure=value)
+                self.assertIsNone(error.tls_failure)
+                self.assert_safe_diagnostic(error)
+
+    def test_tls_failure_boundary_helper_validates_value_category_pair_without_coercion(self):
+        from okx_bot.okx import _safe_tls_failure
+        for value, category in (("certificate", "tls"), ("handshake", "tls"), ("unexpected_eof", "transport")):
+            self.assertEqual(_safe_tls_failure(value, category), value)
+        for value, category in (("certificate", "transport"), ("handshake", "transport"),
+                                ("unexpected_eof", "tls"), ("test-secret", "tls"),
+                                (None, "tls"), ([], "tls"), ({}, "transport"),
+                                ("certificate", []), ("handshake", {}),
+                                ("unexpected_eof", None), (True, "transport")):
+            with self.subTest(value_type=type(value).__name__, category_type=type(category).__name__):
+                self.assertIsNone(_safe_tls_failure(value, category))
+
+    def test_http_error_body_tls_failure_retains_type_without_losing_status(self):
+        from okx_bot.read_retry import is_retryable_read_error
+        class BrokenBody(io.BytesIO):
+            def read(self, size=-1):
+                raise self.failure
+        for cause, category, tls_failure, retryable in (
+            (ssl.SSLCertVerificationError(1, "test-secret"), "tls", "certificate", False),
+            (ssl.SSLError(1, "test-passphrase"), "tls", "handshake", False),
+            (ssl.SSLEOFError(8, "test-key"), "transport", "unexpected_eof", True),
+        ):
+            for order in (False, True):
+                with self.subTest(tls_failure=tls_failure, order=order):
+                    stream = BrokenBody()
+                    stream.failure = cause
+                    failure = urllib.error.HTTPError("https://www.okx.com", 503, "test-secret", {}, stream)
+                    transport = Transport(failure=failure)
+                    expected_error = AmbiguousOrderError if order else OkxError
+                    with self.assertRaises(expected_error) as raised:
+                        if order:
+                            self.client(transport).place_market_order("BTC-USDT-SWAP", "buy", "1", "b1", stop_loss="1", take_profit="2")
+                        else:
+                            self.client(transport).account_config()
+                    self.assertEqual(raised.exception.http_status, 503)
+                    self.assertEqual(raised.exception.category, category)
+                    self.assertEqual(raised.exception.tls_failure, tls_failure)
+                    self.assertEqual(is_retryable_read_error(raised.exception), retryable and not order)
+                    self.assertEqual(len(transport.requests), 1)
+                    self.assert_safe_diagnostic(raised.exception)
+
+    @staticmethod
+    def retry_stop():
+        class Stop:
+            def __init__(self):
+                self.delays = []
+            def is_set(self):
+                return False
+            def wait(self, delay):
+                self.delays.append(delay)
+                return False
+        return Stop()
+
+    def test_read_wrapper_can_retry_typed_tls_eof_with_fresh_read_only_request(self):
+        from okx_bot.read_retry import ReadRetryClient
+        requests = []
+        def opener(request, timeout):
+            requests.append(request)
+            if len(requests) == 1:
+                raise urllib.error.URLError(ssl.SSLEOFError(8, "test-secret"))
+            return io.BytesIO(b'{"code":"0","data":[{"acctLv":"2","posMode":"net_mode"}]}')
+        stop = self.retry_stop()
+        client = ReadRetryClient(OkxClient(self.credentials, opener=opener), stop)
+        self.assertEqual(client.account_config()["acctLv"], "2")
+        self.assertEqual(len(requests), 2)
+        self.assertIsNot(requests[0], requests[1])
+        self.assertTrue(all(request.get_method() == "GET" for request in requests))
+        self.assertEqual(stop.delays, [2])
+
+    def test_read_wrapper_keeps_certificate_and_unknown_handshake_nonretryable(self):
+        from okx_bot.read_retry import ReadRetryClient
+        for failure, tls_failure in ((ssl.SSLCertVerificationError(1, "test-secret"), "certificate"),
+                                     (ssl.SSLError(1, "EOF occurred test-passphrase"), "handshake")):
+            with self.subTest(tls_failure=tls_failure):
+                transport = Transport(failure=urllib.error.URLError(failure))
+                stop = self.retry_stop()
+                with self.assertRaises(OkxError) as raised:
+                    ReadRetryClient(self.client(transport), stop).account_config()
+                self.assertEqual(raised.exception.category, "tls")
+                self.assertEqual(raised.exception.tls_failure, tls_failure)
+                self.assertEqual(len(transport.requests), 1)
+                self.assertEqual(stop.delays, [])
+                self.assert_safe_diagnostic(raised.exception)
+
+    def test_order_eof_is_ambiguous_and_never_retried_by_either_layer(self):
+        from okx_bot.read_retry import ReadRetryClient
+        for failure, expected in ((ssl.SSLEOFError(8, "test-secret"), "unexpected_eof"),
+                                  (ssl.SSLCertVerificationError(1, "test-key"), "certificate"),
+                                  (ssl.SSLError(1, "test-passphrase"), "handshake")):
+            with self.subTest(tls_failure=expected):
+                transport = Transport(failure=urllib.error.URLError(failure))
+                stop = self.retry_stop()
+                with self.assertRaises(AmbiguousOrderError) as raised:
+                    ReadRetryClient(self.client(transport), stop).place_market_order(
+                        "BTC-USDT-SWAP", "buy", "1", "b1", stop_loss="1", take_profit="2")
+                self.assertEqual(raised.exception.tls_failure, expected)
+                self.assertEqual(len(transport.requests), 1)
+                self.assertEqual(stop.delays, [])
                 self.assert_safe_diagnostic(raised.exception)
 
     def test_credential_control_and_non_ascii_characters_are_rejected_safely(self):
